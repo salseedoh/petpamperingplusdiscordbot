@@ -5,7 +5,9 @@ import {
   ButtonStyle,
   Client,
   EmbedBuilder,
+  Events,
   GatewayIntentBits,
+  MessageFlags,
   PermissionFlagsBits,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
@@ -170,27 +172,27 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
 
 async function startTrivia(interaction: ChatInputCommandInteraction): Promise<void> {
   const questions = await activeQuestions();
-  if (!questions.length) return void await interaction.reply({ content: 'There are no active questions yet.', ephemeral: true });
+  if (!questions.length) return void await interaction.editReply({ content: 'There are no active questions yet.' });
   const question = randomQuestion(questions);
   const session = await createSession(question, 'trivia', interaction.guildId!, interaction.channelId, interaction.user.id);
-  await interaction.reply({ embeds: [questionEmbed(question)], components: [questionButtons(session.id)] });
+  await interaction.editReply({ embeds: [questionEmbed(question)], components: [questionButtons(session.id)] });
 }
 
 async function startQuiz(interaction: ChatInputCommandInteraction): Promise<void> {
   const questions = await activeQuestions();
-  if (questions.length < 10) return void await interaction.reply({ content: `A quiz needs at least 10 active questions. There are currently ${questions.length}.`, ephemeral: true });
+  if (questions.length < 10) return void await interaction.editReply({ content: `A quiz needs at least 10 active questions. There are currently ${questions.length}.` });
   const chosen = [...questions].sort(() => Math.random() - 0.5).slice(0, 10);
   const { data: run, error } = await supabase.from('quiz_runs').insert({ discord_user_id: interaction.user.id, guild_id: interaction.guildId, question_ids: chosen.map(question => question.id) }).select().single();
   if (error) throw error;
   const session = await createSession(chosen[0], 'quiz', interaction.guildId!, interaction.channelId, interaction.user.id, null, run.id);
-  await interaction.reply({ embeds: [questionEmbed(chosen[0], '🐾 Quiz Question 1 of 10')], components: [questionButtons(session.id)], ephemeral: true });
+  await interaction.editReply({ embeds: [questionEmbed(chosen[0], '🐾 Quiz Question 1 of 10')], components: [questionButtons(session.id)] });
 }
 
 async function leaderboard(interaction: ChatInputCommandInteraction): Promise<void> {
   const { data, error } = await supabase.from('employee_profiles').select('display_name,total_points,daily_streak').order('total_points', { ascending: false }).limit(10);
   if (error) throw error;
   const text = data?.length ? data.map((row, index) => `**${index + 1}.** ${row.display_name} — ${row.total_points} points (${row.daily_streak}-day streak)`).join('\n') : 'No points have been earned yet.';
-  await interaction.reply({ embeds: [new EmbedBuilder().setColor(0xd69e2e).setTitle('🏆 Leaderboard').setDescription(text)] });
+  await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xd69e2e).setTitle('🏆 Leaderboard').setDescription(text)] });
 }
 
 async function learn(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -199,39 +201,39 @@ async function learn(interaction: ChatInputCommandInteraction): Promise<void> {
   if (topic) query = query.ilike('topic', `%${topic}%`);
   const { data, error } = await query;
   if (error) throw error;
-  if (!data?.length) return void await interaction.reply({ content: 'No active training cards match that topic.', ephemeral: true });
+  if (!data?.length) return void await interaction.editReply({ content: 'No active training cards match that topic.' });
   const card = data[Math.floor(Math.random() * data.length)] as { title: string; warning_signs: string[]; first_steps: string[]; body: string | null };
-  await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x3182ce).setTitle(`📘 ${card.title}`).addFields(
+  await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x3182ce).setTitle(`📘 ${card.title}`).addFields(
     { name: 'Warning signs', value: card.warning_signs.map(item => `• ${item}`).join('\n') || '—' },
     { name: 'First steps', value: card.first_steps.map(item => `• ${item}`).join('\n') || '—' }
   ).setDescription(card.body ?? null)] });
 }
 
 async function adminCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-  if (!isAdmin(interaction)) return void await interaction.reply({ content: 'Administrator permission is required for this command.', ephemeral: true });
+  if (!isAdmin(interaction)) return void await interaction.editReply({ content: 'Administrator permission is required for this command.' });
   if (interaction.commandName === 'addquestion') {
     const options = ['a', 'b', 'c', 'd'].map(name => interaction.options.getString(name, true));
     const { data, error } = await supabase.from('questions').insert({ prompt: interaction.options.getString('prompt', true), options, correct_option: interaction.options.getInteger('correct', true) - 1, explanation: interaction.options.getString('why', true), topic: interaction.options.getString('topic') }).select('id').single();
     if (error) throw error;
-    return void await interaction.reply({ content: `Question added: \`${data.id}\``, ephemeral: true });
+    return void await interaction.editReply({ content: `Question added: \`${data.id}\`` });
   }
   if (interaction.commandName === 'editquestion') {
     const changes = Object.fromEntries([['prompt', interaction.options.getString('prompt')], ['explanation', interaction.options.getString('why')], ['topic', interaction.options.getString('topic')]].filter(([, value]) => value !== null));
-    if (!Object.keys(changes).length) return void await interaction.reply({ content: 'Provide at least one replacement value.', ephemeral: true });
+    if (!Object.keys(changes).length) return void await interaction.editReply({ content: 'Provide at least one replacement value.' });
     const { error } = await supabase.from('questions').update(changes).eq('id', interaction.options.getString('id', true));
     if (error) throw error;
-    return void await interaction.reply({ content: 'Question updated.', ephemeral: true });
+    return void await interaction.editReply({ content: 'Question updated.' });
   }
   if (interaction.commandName === 'disablequestion') {
     const { error } = await supabase.from('questions').update({ enabled: false }).eq('id', interaction.options.getString('id', true));
     if (error) throw error;
-    return void await interaction.reply({ content: 'Question disabled.', ephemeral: true });
+    return void await interaction.editReply({ content: 'Question disabled.' });
   }
   if (interaction.commandName === 'reset_scores') {
-    if (interaction.options.getString('confirm', true) !== 'RESET') return void await interaction.reply({ content: 'Nothing changed. Type `RESET` exactly to confirm.', ephemeral: true });
+    if (interaction.options.getString('confirm', true) !== 'RESET') return void await interaction.editReply({ content: 'Nothing changed. Type `RESET` exactly to confirm.' });
     const { error } = await supabase.from('employee_profiles').update({ total_points: 0, daily_streak: 0, last_daily_date: null, updated_at: new Date().toISOString() }).neq('discord_user_id', '');
     if (error) throw error;
-    return void await interaction.reply({ content: 'All employee scores and streaks were reset.', ephemeral: true });
+    return void await interaction.editReply({ content: 'All employee scores and streaks were reset.' });
   }
   if (interaction.commandName === 'employee_stats') {
     const employee = interaction.options.getUser('employee');
@@ -240,11 +242,11 @@ async function adminCommand(interaction: ChatInputCommandInteraction): Promise<v
     const { data, error } = await query.order('total_points', { ascending: false }).limit(employee ? 1 : 25);
     if (error) throw error;
     const text = data?.length ? data.map(row => `**${row.display_name}** — ${row.total_points} points, ${row.daily_streak}-day streak`).join('\n') : 'No employee data yet.';
-    return void await interaction.reply({ embeds: [new EmbedBuilder().setTitle('Employee stats').setDescription(text)] });
+    return void await interaction.editReply({ embeds: [new EmbedBuilder().setTitle('Employee stats').setDescription(text)] });
   }
   const { count, error } = await supabase.from('question_answers').select('*', { count: 'exact', head: true });
   if (error) throw error;
-  await interaction.reply({ content: `Training activity: ${count ?? 0} submitted answers.`, ephemeral: true });
+  await interaction.editReply({ content: `Training activity: ${count ?? 0} submitted answers.` });
 }
 
 async function handleInteraction(interaction: Interaction): Promise<void> {
@@ -252,6 +254,8 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     if (interaction.isButton() && interaction.customId.startsWith('answer:')) await answerButton(interaction);
     if (!interaction.isChatInputCommand()) return;
     if (!interaction.inGuild()) return void await interaction.reply({ content: 'This bot is available only in the employee server.', ephemeral: true });
+    const privateCommands = new Set(['quiz', 'addquestion', 'editquestion', 'disablequestion', 'trainingreport', 'employee_stats', 'reset_scores']);
+    await interaction.deferReply({ flags: privateCommands.has(interaction.commandName) ? MessageFlags.Ephemeral : undefined });
     if (interaction.commandName === 'trivia') await startTrivia(interaction);
     else if (interaction.commandName === 'quiz') await startQuiz(interaction);
     else if (interaction.commandName === 'leaderboard') await leaderboard(interaction);
@@ -259,15 +263,16 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     else await adminCommand(interaction);
   } catch (error) {
     console.error(error);
-    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.', ephemeral: true });
+    if (interaction.isRepliable() && interaction.deferred) await interaction.editReply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.' });
+    else if (interaction.isRepliable() && !interaction.replied) await interaction.reply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.', ephemeral: true });
   }
 }
 
-client.once('ready', async readyClient => {
+client.once(Events.ClientReady, readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}.`);
-  await resetMissedStreaks();
-  cron.schedule(config.cron, () => void postDailyQuestion().catch(console.error), { timezone: config.timezone });
-  cron.schedule('0 0 * * *', () => void resetMissedStreaks().catch(console.error), { timezone: config.timezone });
+  void resetMissedStreaks().catch(error => console.error('Could not reset missed streaks:', error));
+  cron.schedule(config.cron, () => void postDailyQuestion().catch(error => console.error('Could not post daily question:', error)), { timezone: config.timezone });
+  cron.schedule('0 0 * * *', () => void resetMissedStreaks().catch(error => console.error('Could not reset missed streaks:', error)), { timezone: config.timezone });
 });
 client.on('interactionCreate', interaction => void handleInteraction(interaction));
 client.login(config.discordToken);

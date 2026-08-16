@@ -12,6 +12,8 @@ An internal Discord training bot for first-aid trivia, training cards, daily que
 6. Register the slash commands in the test server: `npm run deploy:commands`.
 7. Start the bot: `npm run dev`.
 
+On Windows, you can instead double-click `setup-and-start.bat` the first time. After that, double-click `start-bot.bat` whenever you want the bot online.
+
 Leave the terminal open while the bot is meant to run. The daily question posts at 6:00 AM Central Time and expires at midnight. If the computer is off then, it will not post until the bot is running again.
 
 ## Commands

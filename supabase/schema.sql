@@ -79,7 +79,11 @@ alter table public.question_answers enable row level security;
 alter table public.employee_profiles enable row level security;
 alter table public.quiz_runs enable row level security;
 
--- The Data API is intentionally not granted access. The Discord bot uses only its secret key.
+-- This project intentionally does not expose new tables to public client roles.
+-- Grant access only to the bot's server-side secret key (the service_role database role).
+grant usage on schema public to service_role;
+grant select, insert, update, delete on all tables in schema public to service_role;
+grant usage, select on all sequences in schema public to service_role;
 
 insert into public.questions (prompt, options, correct_option, explanation, topic)
 select * from (values
