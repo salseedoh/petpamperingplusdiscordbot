@@ -1,0 +1,26 @@
+{
+  "name": "pet-first-aid-discord-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc --noEmit",
+    "start": "tsx src/index.ts",
+    "deploy:commands": "tsx src/deploy-commands.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.112.3",
+    "discord.js": "14.27.0",
+    "dotenv": "17.4.2",
+    "node-cron": "4.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3"
+  }
+}
