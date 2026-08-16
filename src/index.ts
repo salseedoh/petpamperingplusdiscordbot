@@ -17,7 +17,7 @@ import { createClient } from '@supabase/supabase-js';
 import { config } from './config.js';
 
 type Question = { id: string; prompt: string; options: string[]; correct_option: number; explanation: string; topic: string | null };
-type Session = { id: string; question_id: string; kind: 'trivia' | 'quiz' | 'daily'; guild_id: string; owner_discord_user_id: string | null; quiz_run_id: string | null; daily_date: string | null; expires_at: string | null };
+type Session = { id: string; question_id: string; kind: 'trivia' | 'quiz' | 'daily'; guild_id: string; channel_id: string; message_id: string | null; owner_discord_user_id: string | null; quiz_run_id: string | null; daily_date: string | null; expires_at: string | null };
 
 const supabase = createClient(config.supabaseUrl, config.supabaseSecretKey, {
   auth: { autoRefreshToken: false, persistSession: false }
@@ -29,6 +29,12 @@ function todayCentral(): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: config.timezone }).format(new Date());
 }
 
+function previousCentralDate(): string {
+  const date = new Date(`${todayCentral()}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() - 1);
+  return date.toISOString().slice(0, 10);
+}
+
 function questionEmbed(question: Question, heading = '🐾 Pet First Aid Question'): EmbedBuilder {
   return new EmbedBuilder()
     .setColor(0x2f855a)
@@ -36,9 +42,9 @@ function questionEmbed(question: Question, heading = '🐾 Pet First Aid Questio
     .setDescription(`${question.prompt}\n\n${question.options.map((option, index) => `**${letters[index]}.** ${option}`).join('\n')}\n\nSelect an option below.`);
 }
 
-function questionButtons(sessionId: string): ActionRowBuilder<ButtonBuilder> {
+function questionButtons(sessionId: string, disabled = false): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    ...letters.map((letter, index) => new ButtonBuilder().setCustomId(`answer:${sessionId}:${index}`).setLabel(letter).setStyle(ButtonStyle.Primary))
+    ...letters.map((letter, index) => new ButtonBuilder().setCustomId(`answer:${sessionId}:${index}`).setLabel(letter).setStyle(ButtonStyle.Primary).setDisabled(disabled))
   );
 }
 
@@ -71,7 +77,33 @@ async function postDailyQuestion(): Promise<void> {
   if (!questions.length) throw new Error('No enabled questions are available for the daily question.');
   const question = randomQuestion(questions);
   const session = await createSession(question, 'daily', config.guildId, config.dailyChannelId, null, dailyDate);
-  await channel.send({ embeds: [questionEmbed(question, '🐾 Daily Pet First Aid Question')], components: [questionButtons(session.id)] });
+  const message = await channel.send({ embeds: [questionEmbed(question, '🐾 Daily Pet First Aid Question')], components: [questionButtons(session.id)] });
+  const { error } = await supabase.from('question_sessions').update({ message_id: message.id }).eq('id', session.id);
+  if (error) throw error;
+}
+
+async function expiredDailySessions(): Promise<Session[]> {
+  const { data, error } = await supabase.from('question_sessions').select('*').eq('kind', 'daily').eq('daily_date', previousCentralDate()).not('message_id', 'is', null);
+  if (error) throw error;
+  return (data ?? []) as Session[];
+}
+
+async function disableExpiredDailyQuestions(): Promise<void> {
+  for (const session of await expiredDailySessions()) {
+    const channel = await client.channels.fetch(session.channel_id);
+    if (!channel?.isTextBased() || !('messages' in channel)) continue;
+    const message = await channel.messages.fetch(session.message_id!);
+    await message.edit({ components: [questionButtons(session.id, true)] });
+  }
+}
+
+async function deleteExpiredDailyQuestions(): Promise<void> {
+  for (const session of await expiredDailySessions()) {
+    const channel = await client.channels.fetch(session.channel_id);
+    if (!channel?.isTextBased() || !('messages' in channel)) continue;
+    const message = await channel.messages.fetch(session.message_id!);
+    await message.delete();
+  }
 }
 
 async function resetMissedStreaks(): Promise<void> {
@@ -89,11 +121,11 @@ function isAdmin(interaction: ChatInputCommandInteraction): boolean {
 
 async function awardAnswer(session: Session, question: Question, interaction: ButtonInteraction, selected: number): Promise<{ correct: boolean; alreadyAnswered: boolean }> {
   if (session.owner_discord_user_id && session.owner_discord_user_id !== interaction.user.id) {
-    await interaction.reply({ content: 'This question belongs to another employee.', ephemeral: true });
+    await interaction.editReply({ content: 'This question belongs to another employee.' });
     return { correct: false, alreadyAnswered: true };
   }
   if (session.kind === 'daily' && session.daily_date !== todayCentral()) {
-    await interaction.reply({ content: 'This question has expired.', ephemeral: true });
+    await interaction.editReply({ content: 'This question has expired.' });
     return { correct: false, alreadyAnswered: true };
   }
   const correct = selected === question.correct_option;
@@ -102,7 +134,7 @@ async function awardAnswer(session: Session, question: Question, interaction: Bu
     is_correct: correct, points_awarded: correct ? 10 : 0
   });
   if (answerError) {
-    if (answerError.code === '23505') await interaction.reply({ content: 'You have already answered this question.', ephemeral: true });
+    if (answerError.code === '23505') await interaction.editReply({ content: 'You have already answered this question.' });
     else throw answerError;
     return { correct, alreadyAnswered: true };
   }
@@ -130,6 +162,7 @@ async function awardAnswer(session: Session, question: Question, interaction: Bu
 }
 
 async function answerButton(interaction: ButtonInteraction): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const [, sessionId, choiceText] = interaction.customId.split(':');
   const selected = Number(choiceText);
   const { data: sessionData, error: sessionError } = await supabase.from('question_sessions').select('*').eq('id', sessionId).single();
@@ -154,7 +187,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
       const { error } = await supabase.from('quiz_runs').update({ current_index: nextIndex, correct_count: correctCount, completed_at: new Date().toISOString() }).eq('id', run.id);
       if (error) throw error;
       resultEmbed.addFields({ name: 'Quiz complete', value: `You answered **${correctCount}/10** correctly and earned **${correctCount * 10} points**.` });
-      await interaction.reply({ embeds: [resultEmbed], ephemeral: true });
+      await interaction.editReply({ embeds: [resultEmbed] });
       return;
     }
     const { data: nextQuestionData, error: nextQuestionError } = await supabase.from('questions').select('*').eq('id', questionIds[nextIndex]).single();
@@ -163,11 +196,11 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
     if (updateError) throw updateError;
     const nextQuestion = nextQuestionData as Question;
     const nextSession = await createSession(nextQuestion, 'quiz', session.guild_id, interaction.channelId, interaction.user.id, null, run.id);
-    await interaction.reply({ embeds: [resultEmbed], ephemeral: true });
+    await interaction.editReply({ embeds: [resultEmbed] });
     await interaction.followUp({ embeds: [questionEmbed(nextQuestion, `🐾 Quiz Question ${nextIndex + 1} of 10`)], components: [questionButtons(nextSession.id)], ephemeral: true });
     return;
   }
-  await interaction.reply({ embeds: [resultEmbed], ephemeral: session.kind !== 'daily' });
+  await interaction.editReply({ embeds: [resultEmbed] });
 }
 
 async function startTrivia(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -254,8 +287,7 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     if (interaction.isButton() && interaction.customId.startsWith('answer:')) await answerButton(interaction);
     if (!interaction.isChatInputCommand()) return;
     if (!interaction.inGuild()) return void await interaction.reply({ content: 'This bot is available only in the employee server.', ephemeral: true });
-    const privateCommands = new Set(['quiz', 'addquestion', 'editquestion', 'disablequestion', 'trainingreport', 'employee_stats', 'reset_scores']);
-    await interaction.deferReply({ flags: privateCommands.has(interaction.commandName) ? MessageFlags.Ephemeral : undefined });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     if (interaction.commandName === 'trivia') await startTrivia(interaction);
     else if (interaction.commandName === 'quiz') await startQuiz(interaction);
     else if (interaction.commandName === 'leaderboard') await leaderboard(interaction);
@@ -273,6 +305,8 @@ client.once(Events.ClientReady, readyClient => {
   void resetMissedStreaks().catch(error => console.error('Could not reset missed streaks:', error));
   cron.schedule(config.cron, () => void postDailyQuestion().catch(error => console.error('Could not post daily question:', error)), { timezone: config.timezone });
   cron.schedule('0 0 * * *', () => void resetMissedStreaks().catch(error => console.error('Could not reset missed streaks:', error)), { timezone: config.timezone });
+  cron.schedule('0 0 * * *', () => void disableExpiredDailyQuestions().catch(error => console.error('Could not disable expired daily question:', error)), { timezone: config.timezone });
+  cron.schedule('5 0 * * *', () => void deleteExpiredDailyQuestions().catch(error => console.error('Could not delete expired daily question:', error)), { timezone: config.timezone });
 });
 client.on('interactionCreate', interaction => void handleInteraction(interaction));
 client.login(config.discordToken);

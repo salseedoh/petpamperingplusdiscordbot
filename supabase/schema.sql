@@ -32,6 +32,7 @@ create table if not exists public.question_sessions (
   kind text not null check (kind in ('trivia', 'quiz', 'daily')),
   guild_id text not null,
   channel_id text not null,
+  message_id text,
   owner_discord_user_id text,
   daily_date date,
   expires_at timestamptz,
@@ -71,6 +72,7 @@ create table if not exists public.quiz_runs (
 );
 
 alter table public.question_sessions add column if not exists quiz_run_id uuid references public.quiz_runs(id) on delete cascade;
+alter table public.question_sessions add column if not exists message_id text;
 
 alter table public.questions enable row level security;
 alter table public.training_cards enable row level security;
