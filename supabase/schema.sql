@@ -22,6 +22,7 @@ create table if not exists public.training_cards (
   warning_signs text[] not null default '{}',
   first_steps text[] not null default '{}',
   body text,
+  sections jsonb not null default '[]'::jsonb,
   enabled boolean not null default true,
   created_at timestamptz not null default now()
 );
@@ -73,6 +74,7 @@ create table if not exists public.quiz_runs (
 
 alter table public.question_sessions add column if not exists quiz_run_id uuid references public.quiz_runs(id) on delete cascade;
 alter table public.question_sessions add column if not exists message_id text;
+alter table public.training_cards add column if not exists sections jsonb not null default '[]'::jsonb;
 
 -- Supports True/False (2 choices), standard four-choice, and five-choice questions.
 -- These statements also update databases created before variable choice counts were supported.

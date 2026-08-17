@@ -24,6 +24,9 @@ const supabase = createClient(config.supabaseUrl, config.supabaseSecretKey, {
 });
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const letters = ['A', 'B', 'C', 'D', 'E'];
+const QUESTION_EXPIRY_MS = 10 * 60 * 1000;
+const VIEW_EXPIRY_MS = 5 * 60 * 1000;
+const SHORT_EXPIRY_MS = 60 * 1000;
 
 function todayCentral(): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: config.timezone }).format(new Date());
@@ -69,6 +72,13 @@ async function createSession(question: Question, kind: Session['kind'], guildId:
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function deleteReplyAfter(interaction: { deleteReply: (message?: string) => Promise<unknown> }, milliseconds: number, messageId?: string): void {
+  const timer = setTimeout(() => {
+    void interaction.deleteReply(messageId).catch(error => console.warn('Could not remove an expired private response:', error));
+  }, milliseconds);
+  timer.unref();
 }
 
 function isRetriableError(error: unknown): boolean {
@@ -218,11 +228,15 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
   if (questionError || !questionData) throw new Error('Question was not found.');
   const question = questionData as Question;
   const result = await awardAnswer(session, question, interaction, selected);
-  if (result.alreadyAnswered) return;
+  if (result.alreadyAnswered) {
+    deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
+    return;
+  }
+  const explanationSection = question.explanation.trim() ? `\n\n**Why:** ${question.explanation}` : '';
   const resultEmbed = new EmbedBuilder()
     .setColor(result.correct ? 0x38a169 : 0xe53e3e)
     .setTitle(result.correct ? '✅ Correct!' : '❌ Not quite')
-    .setDescription(`**${letters[question.correct_option]} — ${question.options[question.correct_option]}**\n\n**Why:** ${question.explanation}${result.correct ? '\n\n+10 points' : ''}${result.dailyStreak !== null ? `\n\n🔥 **Daily streak:** ${result.dailyStreak} day${result.dailyStreak === 1 ? '' : 's'}` : ''}`);
+    .setDescription(`**${letters[question.correct_option]} — ${question.options[question.correct_option]}**${explanationSection}${result.correct ? '\n\n+10 points' : ''}${result.dailyStreak !== null ? `\n\n🔥 **Daily streak:** ${result.dailyStreak} day${result.dailyStreak === 1 ? '' : 's'}` : ''}`);
   if (session.kind === 'quiz' && session.quiz_run_id) {
     const { data: run, error: runError } = await supabase.from('quiz_runs').select('*').eq('id', session.quiz_run_id).single();
     if (runError || !run) throw new Error('Quiz run was not found.');
@@ -234,6 +248,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
       if (error) throw error;
       resultEmbed.addFields({ name: 'Quiz complete', value: `You answered **${correctCount}/10** correctly and earned **${correctCount * 10} points**.` });
       await interaction.editReply({ embeds: [resultEmbed] });
+      deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
       return;
     }
     const { data: nextQuestionData, error: nextQuestionError } = await supabase.from('questions').select('*').eq('id', questionIds[nextIndex]).single();
@@ -243,28 +258,41 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
     const nextQuestion = nextQuestionData as Question;
     const nextSession = await createSession(nextQuestion, 'quiz', session.guild_id, interaction.channelId, interaction.user.id, null, run.id);
     await interaction.editReply({ embeds: [resultEmbed] });
-    await interaction.followUp({ embeds: [questionEmbed(nextQuestion, `🐾 Quiz Question ${nextIndex + 1} of 10`)], components: [questionButtons(nextSession.id, nextQuestion.options.length)], ephemeral: true });
+    const nextQuestionMessage = await interaction.followUp({ embeds: [questionEmbed(nextQuestion, `🐾 Quiz Question ${nextIndex + 1} of 10`)], components: [questionButtons(nextSession.id, nextQuestion.options.length)], ephemeral: true });
+    deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
+    deleteReplyAfter(interaction, QUESTION_EXPIRY_MS, nextQuestionMessage.id);
     return;
   }
   await interaction.editReply({ embeds: [resultEmbed] });
+  deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
 }
 
 async function startTrivia(interaction: ChatInputCommandInteraction): Promise<void> {
   const questions = await activeQuestions();
-  if (!questions.length) return void await interaction.editReply({ content: 'There are no active questions yet.' });
+  if (!questions.length) {
+    await interaction.editReply({ content: 'There are no active questions yet.' });
+    deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
+    return;
+  }
   const question = randomQuestion(questions);
   const session = await createSession(question, 'trivia', interaction.guildId!, interaction.channelId, interaction.user.id);
   await interaction.editReply({ embeds: [questionEmbed(question)], components: [questionButtons(session.id, question.options.length)] });
+  deleteReplyAfter(interaction, QUESTION_EXPIRY_MS);
 }
 
 async function startQuiz(interaction: ChatInputCommandInteraction): Promise<void> {
   const questions = await activeQuestions();
-  if (questions.length < 10) return void await interaction.editReply({ content: `A quiz needs at least 10 active questions. There are currently ${questions.length}.` });
+  if (questions.length < 10) {
+    await interaction.editReply({ content: `A quiz needs at least 10 active questions. There are currently ${questions.length}.` });
+    deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
+    return;
+  }
   const chosen = [...questions].sort(() => Math.random() - 0.5).slice(0, 10);
   const { data: run, error } = await supabase.from('quiz_runs').insert({ discord_user_id: interaction.user.id, guild_id: interaction.guildId, question_ids: chosen.map(question => question.id) }).select().single();
   if (error) throw error;
   const session = await createSession(chosen[0], 'quiz', interaction.guildId!, interaction.channelId, interaction.user.id, null, run.id);
   await interaction.editReply({ embeds: [questionEmbed(chosen[0], '🐾 Quiz Question 1 of 10')], components: [questionButtons(session.id, chosen[0].options.length)] });
+  deleteReplyAfter(interaction, QUESTION_EXPIRY_MS);
 }
 
 async function leaderboard(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -281,11 +309,15 @@ async function learn(interaction: ChatInputCommandInteraction): Promise<void> {
   const { data, error } = await query;
   if (error) throw error;
   if (!data?.length) return void await interaction.editReply({ content: 'No active training cards match that topic.' });
-  const card = data[Math.floor(Math.random() * data.length)] as { title: string; warning_signs: string[]; first_steps: string[]; body: string | null };
-  await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x3182ce).setTitle(`📘 ${card.title}`).addFields(
-    { name: 'Warning signs', value: card.warning_signs.map(item => `• ${item}`).join('\n') || '—' },
-    { name: 'First steps', value: card.first_steps.map(item => `• ${item}`).join('\n') || '—' }
-  ).setDescription(card.body ?? null)] });
+  const card = data[Math.floor(Math.random() * data.length)] as { title: string; warning_signs: string[]; first_steps: string[]; body: string | null; sections?: Array<{ heading: string; content: string }> };
+  const sections = card.sections?.filter(section => section.heading && section.content) ?? [];
+  const legacySections = [
+    { heading: 'Warning signs', content: card.warning_signs.map(item => `• ${item}`).join('\n') },
+    { heading: 'First steps', content: card.first_steps.map(item => `• ${item}`).join('\n') }
+  ].filter(section => section.content);
+  await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x3182ce).setTitle(`📘 ${card.title}`)
+    .setDescription(card.body ?? null)
+    .addFields(...(sections.length ? sections : legacySections).map(section => ({ name: section.heading, value: section.content })))] });
 }
 
 async function adminCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -304,7 +336,7 @@ async function adminCommand(interaction: ChatInputCommandInteraction): Promise<v
     if (correctOption >= options.length) {
       return void await interaction.editReply({ content: 'The correct-answer number must match one of the choices you provided.' });
     }
-    const { data, error } = await supabase.from('questions').insert({ prompt: interaction.options.getString('prompt', true), options, correct_option: correctOption, explanation: interaction.options.getString('why', true), topic: interaction.options.getString('topic') }).select('id').single();
+    const { data, error } = await supabase.from('questions').insert({ prompt: interaction.options.getString('prompt', true), options, correct_option: correctOption, explanation: interaction.options.getString('why') ?? '', topic: interaction.options.getString('topic') }).select('id').single();
     if (error) throw error;
     return void await interaction.editReply({ content: `Question added: \`${data.id}\`` });
   }
@@ -352,16 +384,25 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     if (interaction.commandName === 'trivia') await startTrivia(interaction);
     else if (interaction.commandName === 'quiz') await startQuiz(interaction);
-    else if (interaction.commandName === 'leaderboard') await leaderboard(interaction);
-    else if (interaction.commandName === 'learn') await learn(interaction);
-    else await adminCommand(interaction);
+    else if (interaction.commandName === 'leaderboard') {
+      await leaderboard(interaction);
+      deleteReplyAfter(interaction, VIEW_EXPIRY_MS);
+    } else if (interaction.commandName === 'learn') {
+      await learn(interaction);
+      deleteReplyAfter(interaction, VIEW_EXPIRY_MS);
+    } else {
+      await adminCommand(interaction);
+      deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
+    }
   } catch (error) {
     console.error(error);
     try {
       if (interaction.isRepliable() && interaction.deferred) {
         await interaction.editReply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.' });
+        deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
       } else if (interaction.isRepliable() && !interaction.replied) {
         await interaction.reply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.', ephemeral: true });
+        deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
       }
     } catch (responseError) {
       // A network outage can prevent both the original acknowledgement and this fallback response.

@@ -11,7 +11,7 @@ export const commands = [
     .addStringOption(option => option.setName('a').setDescription('Answer A.').setRequired(true))
     .addStringOption(option => option.setName('b').setDescription('Answer B.').setRequired(true))
     .addIntegerOption(option => option.setName('correct').setDescription('Correct answer number: 1=A through 5=E.').setRequired(true).setMinValue(1).setMaxValue(5))
-    .addStringOption(option => option.setName('why').setDescription('Why the answer is correct.').setRequired(true))
+    .addStringOption(option => option.setName('why').setDescription('Optional explanation of why the answer is correct.'))
     .addStringOption(option => option.setName('c').setDescription('Answer C (required for 4 or 5 choices).'))
     .addStringOption(option => option.setName('d').setDescription('Answer D (required for 4 or 5 choices).'))
     .addStringOption(option => option.setName('e').setDescription('Answer E (optional fifth choice).'))
