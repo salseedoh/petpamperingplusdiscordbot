@@ -6,8 +6,8 @@ create extension if not exists pgcrypto;
 create table if not exists public.questions (
   id uuid primary key default gen_random_uuid(),
   prompt text not null,
-  options jsonb not null check (jsonb_typeof(options) = 'array' and jsonb_array_length(options) = 4),
-  correct_option smallint not null check (correct_option between 0 and 3),
+  options jsonb not null constraint questions_options_choice_count_check check (jsonb_typeof(options) = 'array' and jsonb_array_length(options) in (2, 4, 5)),
+  correct_option smallint not null constraint questions_correct_option_range_check check (correct_option >= 0 and correct_option < jsonb_array_length(options)),
   explanation text not null,
   topic text,
   enabled boolean not null default true,
@@ -44,7 +44,7 @@ create table if not exists public.question_answers (
   id uuid primary key default gen_random_uuid(),
   session_id uuid not null references public.question_sessions(id) on delete cascade,
   discord_user_id text not null,
-  selected_option smallint not null check (selected_option between 0 and 3),
+  selected_option smallint not null check (selected_option between 0 and 4),
   is_correct boolean not null,
   points_awarded integer not null default 0 check (points_awarded >= 0),
   answered_at timestamptz not null default now(),
@@ -73,6 +73,17 @@ create table if not exists public.quiz_runs (
 
 alter table public.question_sessions add column if not exists quiz_run_id uuid references public.quiz_runs(id) on delete cascade;
 alter table public.question_sessions add column if not exists message_id text;
+
+-- Supports True/False (2 choices), standard four-choice, and five-choice questions.
+-- These statements also update databases created before variable choice counts were supported.
+alter table public.questions drop constraint if exists questions_options_check;
+alter table public.questions drop constraint if exists questions_correct_option_check;
+alter table public.questions drop constraint if exists questions_options_choice_count_check;
+alter table public.questions drop constraint if exists questions_correct_option_range_check;
+alter table public.questions add constraint questions_options_choice_count_check check (jsonb_typeof(options) = 'array' and jsonb_array_length(options) in (2, 4, 5));
+alter table public.questions add constraint questions_correct_option_range_check check (correct_option >= 0 and correct_option < jsonb_array_length(options));
+alter table public.question_answers drop constraint if exists question_answers_selected_option_check;
+alter table public.question_answers add constraint question_answers_selected_option_check check (selected_option between 0 and 4);
 
 alter table public.questions enable row level security;
 alter table public.training_cards enable row level security;

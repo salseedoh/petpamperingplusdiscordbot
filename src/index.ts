@@ -23,7 +23,7 @@ const supabase = createClient(config.supabaseUrl, config.supabaseSecretKey, {
   auth: { autoRefreshToken: false, persistSession: false }
 });
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const letters = ['A', 'B', 'C', 'D'];
+const letters = ['A', 'B', 'C', 'D', 'E'];
 
 function todayCentral(): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: config.timezone }).format(new Date());
@@ -42,9 +42,9 @@ function questionEmbed(question: Question, heading = '🐾 Pet First Aid Questio
     .setDescription(`${question.prompt}\n\n${question.options.map((option, index) => `**${letters[index]}.** ${option}`).join('\n')}\n\nSelect an option below.`);
 }
 
-function questionButtons(sessionId: string, disabled = false): ActionRowBuilder<ButtonBuilder> {
+function questionButtons(sessionId: string, optionCount: number, disabled = false): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    ...letters.map((letter, index) => new ButtonBuilder().setCustomId(`answer:${sessionId}:${index}`).setLabel(letter).setStyle(ButtonStyle.Primary).setDisabled(disabled))
+    ...letters.slice(0, optionCount).map((letter, index) => new ButtonBuilder().setCustomId(`answer:${sessionId}:${index}`).setLabel(letter).setStyle(ButtonStyle.Primary).setDisabled(disabled))
   );
 }
 
@@ -67,19 +67,65 @@ async function createSession(question: Question, kind: Session['kind'], guildId:
   return data as Session;
 }
 
-async function postDailyQuestion(): Promise<void> {
+function wait(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function isRetriableError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return true;
+  const status = (error as { status?: unknown }).status;
+  // Client-side Discord and Supabase errors (such as missing permissions) will
+  // not succeed after a retry. Network failures and server errors may recover.
+  return typeof status !== 'number' || status === 408 || status === 429 || status >= 500;
+}
+
+async function retry<T>(label: string, operation: () => Promise<T>, attempts = 4): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts || !isRetriableError(error)) break;
+      const delay = attempt * 60_000;
+      console.warn(`${label} failed (attempt ${attempt}/${attempts}); retrying in ${delay / 60_000} minute(s).`, error);
+      await wait(delay);
+    }
+  }
+  throw lastError;
+}
+
+async function postDailyQuestion(): Promise<boolean> {
   const channel = await client.channels.fetch(config.dailyChannelId);
   if (!channel?.isTextBased() || !('send' in channel)) throw new Error('DAILY_CHANNEL_ID must be a text channel.');
   const dailyDate = todayCentral();
-  const { data: existing } = await supabase.from('question_sessions').select('id').eq('guild_id', config.guildId).eq('daily_date', dailyDate).maybeSingle();
-  if (existing) return;
-  const questions = await activeQuestions();
-  if (!questions.length) throw new Error('No enabled questions are available for the daily question.');
-  const question = randomQuestion(questions);
-  const session = await createSession(question, 'daily', config.guildId, config.dailyChannelId, null, dailyDate);
-  const message = await channel.send({ embeds: [questionEmbed(question, '🐾 Daily Pet First Aid Question')], components: [questionButtons(session.id)] });
-  const { error } = await supabase.from('question_sessions').update({ message_id: message.id }).eq('id', session.id);
+  const { data: existing, error: existingError } = await supabase.from('question_sessions').select('*').eq('guild_id', config.guildId).eq('daily_date', dailyDate).maybeSingle();
+  if (existingError) throw existingError;
+
+  let session: Session;
+  let question: Question;
+  if (existing) {
+    session = existing as Session;
+    if (session.message_id) return false;
+    const { data: questionData, error: questionError } = await supabase.from('questions').select('*').eq('id', session.question_id).single();
+    if (questionError || !questionData) throw new Error('The saved daily question could not be found.');
+    question = questionData as Question;
+  } else {
+    const questions = await activeQuestions();
+    if (!questions.length) throw new Error('No enabled questions are available for the daily question.');
+    question = randomQuestion(questions);
+    session = await createSession(question, 'daily', config.guildId, config.dailyChannelId, null, dailyDate);
+  }
+  const message = await channel.send({ embeds: [questionEmbed(question, '🐾 Daily Pet First Aid Question')], components: [questionButtons(session.id, question.options.length)] });
+  const { error } = await supabase.from('question_sessions').update({ message_id: message.id, channel_id: config.dailyChannelId }).eq('id', session.id);
   if (error) throw error;
+  return true;
+}
+
+async function ensureDailyQuestion(reason: string): Promise<boolean> {
+  const posted = await retry(`Daily question (${reason})`, () => postDailyQuestion());
+  if (posted) console.log(`Posted daily question (${reason}).`);
+  return posted;
 }
 
 async function expiredDailySessions(): Promise<Session[]> {
@@ -93,7 +139,7 @@ async function disableExpiredDailyQuestions(): Promise<void> {
     const channel = await client.channels.fetch(session.channel_id);
     if (!channel?.isTextBased() || !('messages' in channel)) continue;
     const message = await channel.messages.fetch(session.message_id!);
-    await message.edit({ components: [questionButtons(session.id, true)] });
+    await message.edit({ components: [] });
   }
 }
 
@@ -119,14 +165,14 @@ function isAdmin(interaction: ChatInputCommandInteraction): boolean {
   return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ?? false;
 }
 
-async function awardAnswer(session: Session, question: Question, interaction: ButtonInteraction, selected: number): Promise<{ correct: boolean; alreadyAnswered: boolean }> {
+async function awardAnswer(session: Session, question: Question, interaction: ButtonInteraction, selected: number): Promise<{ correct: boolean; alreadyAnswered: boolean; dailyStreak: number | null }> {
   if (session.owner_discord_user_id && session.owner_discord_user_id !== interaction.user.id) {
     await interaction.editReply({ content: 'This question belongs to another employee.' });
-    return { correct: false, alreadyAnswered: true };
+    return { correct: false, alreadyAnswered: true, dailyStreak: null };
   }
   if (session.kind === 'daily' && session.daily_date !== todayCentral()) {
     await interaction.editReply({ content: 'This question has expired.' });
-    return { correct: false, alreadyAnswered: true };
+    return { correct: false, alreadyAnswered: true, dailyStreak: null };
   }
   const correct = selected === question.correct_option;
   const { error: answerError } = await supabase.from('question_answers').insert({
@@ -136,7 +182,7 @@ async function awardAnswer(session: Session, question: Question, interaction: Bu
   if (answerError) {
     if (answerError.code === '23505') await interaction.editReply({ content: 'You have already answered this question.' });
     else throw answerError;
-    return { correct, alreadyAnswered: true };
+    return { correct, alreadyAnswered: true, dailyStreak: null };
   }
 
   const { data: profile } = await supabase.from('employee_profiles').select('*').eq('discord_user_id', interaction.user.id).maybeSingle();
@@ -158,7 +204,7 @@ async function awardAnswer(session: Session, question: Question, interaction: Bu
     updated_at: new Date().toISOString()
   });
   if (profileError) throw profileError;
-  return { correct, alreadyAnswered: false };
+  return { correct, alreadyAnswered: false, dailyStreak: dailyDate ? streak : null };
 }
 
 async function answerButton(interaction: ButtonInteraction): Promise<void> {
@@ -176,7 +222,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
   const resultEmbed = new EmbedBuilder()
     .setColor(result.correct ? 0x38a169 : 0xe53e3e)
     .setTitle(result.correct ? '✅ Correct!' : '❌ Not quite')
-    .setDescription(`**${letters[question.correct_option]} — ${question.options[question.correct_option]}**\n\n**Why:** ${question.explanation}${result.correct ? '\n\n+10 points' : ''}`);
+    .setDescription(`**${letters[question.correct_option]} — ${question.options[question.correct_option]}**\n\n**Why:** ${question.explanation}${result.correct ? '\n\n+10 points' : ''}${result.dailyStreak !== null ? `\n\n🔥 **Daily streak:** ${result.dailyStreak} day${result.dailyStreak === 1 ? '' : 's'}` : ''}`);
   if (session.kind === 'quiz' && session.quiz_run_id) {
     const { data: run, error: runError } = await supabase.from('quiz_runs').select('*').eq('id', session.quiz_run_id).single();
     if (runError || !run) throw new Error('Quiz run was not found.');
@@ -197,7 +243,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
     const nextQuestion = nextQuestionData as Question;
     const nextSession = await createSession(nextQuestion, 'quiz', session.guild_id, interaction.channelId, interaction.user.id, null, run.id);
     await interaction.editReply({ embeds: [resultEmbed] });
-    await interaction.followUp({ embeds: [questionEmbed(nextQuestion, `🐾 Quiz Question ${nextIndex + 1} of 10`)], components: [questionButtons(nextSession.id)], ephemeral: true });
+    await interaction.followUp({ embeds: [questionEmbed(nextQuestion, `🐾 Quiz Question ${nextIndex + 1} of 10`)], components: [questionButtons(nextSession.id, nextQuestion.options.length)], ephemeral: true });
     return;
   }
   await interaction.editReply({ embeds: [resultEmbed] });
@@ -208,7 +254,7 @@ async function startTrivia(interaction: ChatInputCommandInteraction): Promise<vo
   if (!questions.length) return void await interaction.editReply({ content: 'There are no active questions yet.' });
   const question = randomQuestion(questions);
   const session = await createSession(question, 'trivia', interaction.guildId!, interaction.channelId, interaction.user.id);
-  await interaction.editReply({ embeds: [questionEmbed(question)], components: [questionButtons(session.id)] });
+  await interaction.editReply({ embeds: [questionEmbed(question)], components: [questionButtons(session.id, question.options.length)] });
 }
 
 async function startQuiz(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -218,7 +264,7 @@ async function startQuiz(interaction: ChatInputCommandInteraction): Promise<void
   const { data: run, error } = await supabase.from('quiz_runs').insert({ discord_user_id: interaction.user.id, guild_id: interaction.guildId, question_ids: chosen.map(question => question.id) }).select().single();
   if (error) throw error;
   const session = await createSession(chosen[0], 'quiz', interaction.guildId!, interaction.channelId, interaction.user.id, null, run.id);
-  await interaction.editReply({ embeds: [questionEmbed(chosen[0], '🐾 Quiz Question 1 of 10')], components: [questionButtons(session.id)] });
+  await interaction.editReply({ embeds: [questionEmbed(chosen[0], '🐾 Quiz Question 1 of 10')], components: [questionButtons(session.id, chosen[0].options.length)] });
 }
 
 async function leaderboard(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -245,8 +291,20 @@ async function learn(interaction: ChatInputCommandInteraction): Promise<void> {
 async function adminCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   if (!isAdmin(interaction)) return void await interaction.editReply({ content: 'Administrator permission is required for this command.' });
   if (interaction.commandName === 'addquestion') {
-    const options = ['a', 'b', 'c', 'd'].map(name => interaction.options.getString(name, true));
-    const { data, error } = await supabase.from('questions').insert({ prompt: interaction.options.getString('prompt', true), options, correct_option: interaction.options.getInteger('correct', true) - 1, explanation: interaction.options.getString('why', true), topic: interaction.options.getString('topic') }).select('id').single();
+    const optionA = interaction.options.getString('a', true);
+    const optionB = interaction.options.getString('b', true);
+    const optionC = interaction.options.getString('c');
+    const optionD = interaction.options.getString('d');
+    const optionE = interaction.options.getString('e');
+    if ((optionC === null) !== (optionD === null) || (optionE !== null && optionD === null)) {
+      return void await interaction.editReply({ content: 'Use either 2 choices (A–B), 4 choices (A–D), or 5 choices (A–E).' });
+    }
+    const options = [optionA, optionB, optionC, optionD, optionE].filter((option): option is string => option !== null);
+    const correctOption = interaction.options.getInteger('correct', true) - 1;
+    if (correctOption >= options.length) {
+      return void await interaction.editReply({ content: 'The correct-answer number must match one of the choices you provided.' });
+    }
+    const { data, error } = await supabase.from('questions').insert({ prompt: interaction.options.getString('prompt', true), options, correct_option: correctOption, explanation: interaction.options.getString('why', true), topic: interaction.options.getString('topic') }).select('id').single();
     if (error) throw error;
     return void await interaction.editReply({ content: `Question added: \`${data.id}\`` });
   }
@@ -261,6 +319,10 @@ async function adminCommand(interaction: ChatInputCommandInteraction): Promise<v
     const { error } = await supabase.from('questions').update({ enabled: false }).eq('id', interaction.options.getString('id', true));
     if (error) throw error;
     return void await interaction.editReply({ content: 'Question disabled.' });
+  }
+  if (interaction.commandName === 'postdaily') {
+    const posted = await ensureDailyQuestion('administrator request');
+    return void await interaction.editReply({ content: posted ? 'Today\'s daily question was posted in the daily channel.' : 'Today already has a daily question.' });
   }
   if (interaction.commandName === 'reset_scores') {
     if (interaction.options.getString('confirm', true) !== 'RESET') return void await interaction.editReply({ content: 'Nothing changed. Type `RESET` exactly to confirm.' });
@@ -295,15 +357,25 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     else await adminCommand(interaction);
   } catch (error) {
     console.error(error);
-    if (interaction.isRepliable() && interaction.deferred) await interaction.editReply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.' });
-    else if (interaction.isRepliable() && !interaction.replied) await interaction.reply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.', ephemeral: true });
+    try {
+      if (interaction.isRepliable() && interaction.deferred) {
+        await interaction.editReply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.' });
+      } else if (interaction.isRepliable() && !interaction.replied) {
+        await interaction.reply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.', ephemeral: true });
+      }
+    } catch (responseError) {
+      // A network outage can prevent both the original acknowledgement and this fallback response.
+      // Log that separately, but keep the bot running for its scheduled retries and later commands.
+      console.error('Could not send the interaction error message:', responseError);
+    }
   }
 }
 
 client.once(Events.ClientReady, readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}.`);
   void resetMissedStreaks().catch(error => console.error('Could not reset missed streaks:', error));
-  cron.schedule(config.cron, () => void postDailyQuestion().catch(error => console.error('Could not post daily question:', error)), { timezone: config.timezone });
+  cron.schedule(config.cron, () => void ensureDailyQuestion('scheduled time').catch(error => console.error('Could not post daily question:', error)), { timezone: config.timezone });
+  cron.schedule('15,30,45 6-11 * * *', () => void ensureDailyQuestion('morning catch-up').catch(error => console.error('Could not catch up daily question:', error)), { timezone: config.timezone });
   cron.schedule('0 0 * * *', () => void resetMissedStreaks().catch(error => console.error('Could not reset missed streaks:', error)), { timezone: config.timezone });
   cron.schedule('0 0 * * *', () => void disableExpiredDailyQuestions().catch(error => console.error('Could not disable expired daily question:', error)), { timezone: config.timezone });
   cron.schedule('5 0 * * *', () => void deleteExpiredDailyQuestions().catch(error => console.error('Could not delete expired daily question:', error)), { timezone: config.timezone });
