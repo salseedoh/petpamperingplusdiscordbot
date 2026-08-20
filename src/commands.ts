@@ -2,7 +2,7 @@ import { SlashCommandBuilder } from 'discord.js';
 
 export const commands = [
   new SlashCommandBuilder().setName('trivia').setDescription('Answer one random trivia question.'),
-  new SlashCommandBuilder().setName('quiz').setDescription('Start a ten-question quiz.'),
+  new SlashCommandBuilder().setName('quiz').setDescription('Start a five-question quiz.'),
   new SlashCommandBuilder().setName('leaderboard').setDescription('Show the current leaderboard.'),
   new SlashCommandBuilder().setName('learn').setDescription('Show a random training card.').addStringOption(option => option.setName('topic').setDescription('Optional topic to filter by.')),
   new SlashCommandBuilder()
@@ -25,6 +25,7 @@ export const commands = [
   new SlashCommandBuilder().setName('disablequestion').setDescription('Disable a question.').addStringOption(option => option.setName('id').setDescription('Question ID.').setRequired(true)),
   new SlashCommandBuilder().setName('trainingreport').setDescription('Show training activity for this server.'),
   new SlashCommandBuilder().setName('postdaily').setDescription('Post today\'s daily question now.'),
+  new SlashCommandBuilder().setName('postmenu').setDescription('Post the employee button menu in this channel.'),
   new SlashCommandBuilder().setName('employee_stats').setDescription('Show points and streaks.').addUserOption(option => option.setName('employee').setDescription('Optional employee.')),
   new SlashCommandBuilder().setName('reset_scores').setDescription('Reset every employee score and streak.').addStringOption(option => option.setName('confirm').setDescription('Type RESET to confirm.').setRequired(true))
 ].map(command => command.toJSON());

@@ -18,6 +18,7 @@ import { config } from './config.js';
 
 type Question = { id: string; prompt: string; options: string[]; correct_option: number; explanation: string; topic: string | null };
 type Session = { id: string; question_id: string; kind: 'trivia' | 'quiz' | 'daily'; guild_id: string; channel_id: string; message_id: string | null; owner_discord_user_id: string | null; quiz_run_id: string | null; daily_date: string | null; expires_at: string | null };
+type PrivateInteraction = ChatInputCommandInteraction | ButtonInteraction;
 
 const supabase = createClient(config.supabaseUrl, config.supabaseSecretKey, {
   auth: { autoRefreshToken: false, persistSession: false }
@@ -27,6 +28,7 @@ const letters = ['A', 'B', 'C', 'D', 'E'];
 const QUESTION_EXPIRY_MS = 10 * 60 * 1000;
 const VIEW_EXPIRY_MS = 5 * 60 * 1000;
 const SHORT_EXPIRY_MS = 60 * 1000;
+const QUIZ_QUESTION_COUNT = 5;
 
 function todayCentral(): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: config.timezone }).format(new Date());
@@ -49,6 +51,21 @@ function questionButtons(sessionId: string, optionCount: number, disabled = fals
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     ...letters.slice(0, optionCount).map((letter, index) => new ButtonBuilder().setCustomId(`answer:${sessionId}:${index}`).setLabel(letter).setStyle(ButtonStyle.Primary).setDisabled(disabled))
   );
+}
+
+function employeeMenu(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder>[] } {
+  return {
+    embeds: [new EmbedBuilder()
+      .setColor(0x3182ce)
+      .setTitle('🐾 Pet First Aid Menu')
+      .setDescription('Choose an option below. Your result will be visible only to you.')],
+    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId('menu:trivia').setLabel('Trivia').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('menu:quiz').setLabel('Quiz').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('menu:learn').setLabel('Learn').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('menu:leaderboard').setLabel('Leaderboard').setStyle(ButtonStyle.Secondary)
+    )]
+  };
 }
 
 async function activeQuestions(): Promise<Question[]> {
@@ -246,7 +263,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
     if (nextIndex >= questionIds.length) {
       const { error } = await supabase.from('quiz_runs').update({ current_index: nextIndex, correct_count: correctCount, completed_at: new Date().toISOString() }).eq('id', run.id);
       if (error) throw error;
-      resultEmbed.addFields({ name: 'Quiz complete', value: `You answered **${correctCount}/10** correctly and earned **${correctCount * 10} points**.` });
+      resultEmbed.addFields({ name: 'Quiz complete', value: `You answered **${correctCount}/${QUIZ_QUESTION_COUNT}** correctly and earned **${correctCount * 10} points**.` });
       await interaction.editReply({ embeds: [resultEmbed] });
       deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
       return;
@@ -258,7 +275,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
     const nextQuestion = nextQuestionData as Question;
     const nextSession = await createSession(nextQuestion, 'quiz', session.guild_id, interaction.channelId, interaction.user.id, null, run.id);
     await interaction.editReply({ embeds: [resultEmbed] });
-    const nextQuestionMessage = await interaction.followUp({ embeds: [questionEmbed(nextQuestion, `🐾 Quiz Question ${nextIndex + 1} of 10`)], components: [questionButtons(nextSession.id, nextQuestion.options.length)], ephemeral: true });
+    const nextQuestionMessage = await interaction.followUp({ embeds: [questionEmbed(nextQuestion, `🐾 Quiz Question ${nextIndex + 1} of ${QUIZ_QUESTION_COUNT}`)], components: [questionButtons(nextSession.id, nextQuestion.options.length)], ephemeral: true });
     deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
     deleteReplyAfter(interaction, QUESTION_EXPIRY_MS, nextQuestionMessage.id);
     return;
@@ -267,7 +284,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
   deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
 }
 
-async function startTrivia(interaction: ChatInputCommandInteraction): Promise<void> {
+async function startTrivia(interaction: PrivateInteraction): Promise<void> {
   const questions = await activeQuestions();
   if (!questions.length) {
     await interaction.editReply({ content: 'There are no active questions yet.' });
@@ -280,31 +297,30 @@ async function startTrivia(interaction: ChatInputCommandInteraction): Promise<vo
   deleteReplyAfter(interaction, QUESTION_EXPIRY_MS);
 }
 
-async function startQuiz(interaction: ChatInputCommandInteraction): Promise<void> {
+async function startQuiz(interaction: PrivateInteraction): Promise<void> {
   const questions = await activeQuestions();
-  if (questions.length < 10) {
-    await interaction.editReply({ content: `A quiz needs at least 10 active questions. There are currently ${questions.length}.` });
+  if (questions.length < QUIZ_QUESTION_COUNT) {
+    await interaction.editReply({ content: `A quiz needs at least ${QUIZ_QUESTION_COUNT} active questions. There are currently ${questions.length}.` });
     deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
     return;
   }
-  const chosen = [...questions].sort(() => Math.random() - 0.5).slice(0, 10);
+  const chosen = [...questions].sort(() => Math.random() - 0.5).slice(0, QUIZ_QUESTION_COUNT);
   const { data: run, error } = await supabase.from('quiz_runs').insert({ discord_user_id: interaction.user.id, guild_id: interaction.guildId, question_ids: chosen.map(question => question.id) }).select().single();
   if (error) throw error;
   const session = await createSession(chosen[0], 'quiz', interaction.guildId!, interaction.channelId, interaction.user.id, null, run.id);
-  await interaction.editReply({ embeds: [questionEmbed(chosen[0], '🐾 Quiz Question 1 of 10')], components: [questionButtons(session.id, chosen[0].options.length)] });
+  await interaction.editReply({ embeds: [questionEmbed(chosen[0], `🐾 Quiz Question 1 of ${QUIZ_QUESTION_COUNT}`)], components: [questionButtons(session.id, chosen[0].options.length)] });
   deleteReplyAfter(interaction, QUESTION_EXPIRY_MS);
 }
 
-async function leaderboard(interaction: ChatInputCommandInteraction): Promise<void> {
+async function leaderboard(interaction: PrivateInteraction): Promise<void> {
   const { data, error } = await supabase.from('employee_profiles').select('display_name,total_points,daily_streak').order('total_points', { ascending: false }).limit(10);
   if (error) throw error;
   const text = data?.length ? data.map((row, index) => `**${index + 1}.** ${row.display_name} — ${row.total_points} points (${row.daily_streak}-day streak)`).join('\n') : 'No points have been earned yet.';
   await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xd69e2e).setTitle('🏆 Leaderboard').setDescription(text)] });
 }
 
-async function learn(interaction: ChatInputCommandInteraction): Promise<void> {
+async function learn(interaction: PrivateInteraction, topic?: string): Promise<void> {
   let query = supabase.from('training_cards').select('*').eq('enabled', true);
-  const topic = interaction.options.getString('topic');
   if (topic) query = query.ilike('topic', `%${topic}%`);
   const { data, error } = await query;
   if (error) throw error;
@@ -356,6 +372,13 @@ async function adminCommand(interaction: ChatInputCommandInteraction): Promise<v
     const posted = await ensureDailyQuestion('administrator request');
     return void await interaction.editReply({ content: posted ? 'Today\'s daily question was posted in the daily channel.' : 'Today already has a daily question.' });
   }
+  if (interaction.commandName === 'postmenu') {
+    if (!interaction.channel?.isTextBased() || !('send' in interaction.channel)) {
+      return void await interaction.editReply({ content: 'Run this command in a text channel.' });
+    }
+    await interaction.channel.send(employeeMenu());
+    return void await interaction.editReply({ content: 'Employee menu posted. Pin that menu message in this channel so employees can find it easily.' });
+  }
   if (interaction.commandName === 'reset_scores') {
     if (interaction.options.getString('confirm', true) !== 'RESET') return void await interaction.editReply({ content: 'Nothing changed. Type `RESET` exactly to confirm.' });
     const { error } = await supabase.from('employee_profiles').update({ total_points: 0, daily_streak: 0, last_daily_date: null, updated_at: new Date().toISOString() }).neq('discord_user_id', '');
@@ -378,7 +401,27 @@ async function adminCommand(interaction: ChatInputCommandInteraction): Promise<v
 
 async function handleInteraction(interaction: Interaction): Promise<void> {
   try {
-    if (interaction.isButton() && interaction.customId.startsWith('answer:')) await answerButton(interaction);
+    if (interaction.isButton() && interaction.customId.startsWith('answer:')) {
+      await answerButton(interaction);
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('menu:')) {
+      if (!interaction.inGuild()) return void await interaction.reply({ content: 'This menu is available only in the employee server.', ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const action = interaction.customId.split(':')[1];
+      if (action === 'trivia') {
+        await startTrivia(interaction);
+      } else if (action === 'quiz') {
+        await startQuiz(interaction);
+      } else if (action === 'learn') {
+        await learn(interaction);
+        deleteReplyAfter(interaction, VIEW_EXPIRY_MS);
+      } else if (action === 'leaderboard') {
+        await leaderboard(interaction);
+        deleteReplyAfter(interaction, VIEW_EXPIRY_MS);
+      }
+      return;
+    }
     if (!interaction.isChatInputCommand()) return;
     if (!interaction.inGuild()) return void await interaction.reply({ content: 'This bot is available only in the employee server.', ephemeral: true });
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -388,7 +431,7 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
       await leaderboard(interaction);
       deleteReplyAfter(interaction, VIEW_EXPIRY_MS);
     } else if (interaction.commandName === 'learn') {
-      await learn(interaction);
+      await learn(interaction, interaction.options.getString('topic') ?? undefined);
       deleteReplyAfter(interaction, VIEW_EXPIRY_MS);
     } else {
       await adminCommand(interaction);
