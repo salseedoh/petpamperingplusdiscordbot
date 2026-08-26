@@ -312,11 +312,40 @@ async function startQuiz(interaction: PrivateInteraction): Promise<void> {
   deleteReplyAfter(interaction, QUESTION_EXPIRY_MS);
 }
 
+async function dailyTriviaStatus(guildId: string, discordUserId: string): Promise<string> {
+  const { data: session, error: sessionError } = await supabase
+    .from('question_sessions')
+    .select('id')
+    .eq('kind', 'daily')
+    .eq('guild_id', guildId)
+    .eq('daily_date', todayCentral())
+    .maybeSingle();
+  if (sessionError) throw sessionError;
+  if (!session) return '⌛ Not posted yet';
+
+  const { data: answer, error: answerError } = await supabase
+    .from('question_answers')
+    .select('id')
+    .eq('session_id', session.id)
+    .eq('discord_user_id', discordUserId)
+    .maybeSingle();
+  if (answerError) throw answerError;
+  return answer ? '✅ Completed today' : '⏳ Not completed today';
+}
+
 async function leaderboard(interaction: PrivateInteraction): Promise<void> {
-  const { data, error } = await supabase.from('employee_profiles').select('display_name,total_points,daily_streak').order('total_points', { ascending: false }).limit(10);
+  const [leaderboardResult, dailyStatus] = await Promise.all([
+    supabase.from('employee_profiles').select('display_name,total_points,daily_streak').order('total_points', { ascending: false }).limit(10),
+    dailyTriviaStatus(interaction.guildId!, interaction.user.id)
+  ]);
+  const { data, error } = leaderboardResult;
   if (error) throw error;
   const text = data?.length ? data.map((row, index) => `**${index + 1}.** ${row.display_name} — ${row.total_points} points (${row.daily_streak}-day streak)`).join('\n') : 'No points have been earned yet.';
-  await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xd69e2e).setTitle('🏆 Leaderboard').setDescription(text)] });
+  await interaction.editReply({ embeds: [new EmbedBuilder()
+    .setColor(0xd69e2e)
+    .setTitle('🏆 Leaderboard')
+    .setDescription(text)
+    .addFields({ name: 'Today’s daily trivia', value: dailyStatus })] });
 }
 
 async function learn(interaction: PrivateInteraction, topic?: string): Promise<void> {
