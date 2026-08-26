@@ -73,6 +73,15 @@ create table if not exists public.quiz_runs (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.employee_milestones (
+  id uuid primary key default gen_random_uuid(),
+  discord_user_id text not null references public.employee_profiles(discord_user_id) on delete cascade,
+  kind text not null check (kind in ('correct_answers', 'daily_streak')),
+  milestone_value integer not null check (milestone_value > 0),
+  achieved_at timestamptz not null default now(),
+  unique (discord_user_id, kind, milestone_value)
+);
+
 alter table public.question_sessions add column if not exists quiz_run_id uuid references public.quiz_runs(id) on delete cascade;
 alter table public.question_sessions add column if not exists message_id text;
 alter table public.training_cards add column if not exists sections jsonb not null default '[]'::jsonb;
@@ -97,12 +106,16 @@ alter table public.question_sessions enable row level security;
 alter table public.question_answers enable row level security;
 alter table public.employee_profiles enable row level security;
 alter table public.quiz_runs enable row level security;
+alter table public.employee_milestones enable row level security;
 
 -- This project intentionally does not expose new tables to public client roles.
 -- Grant access only to the bot's server-side secret key (the service_role database role).
 grant usage on schema public to service_role;
 grant select, insert, update, delete on all tables in schema public to service_role;
 grant usage, select on all sequences in schema public to service_role;
+
+create index if not exists question_answers_correct_user_idx on public.question_answers (discord_user_id) where is_correct;
+create index if not exists question_answers_answered_at_idx on public.question_answers (answered_at);
 
 insert into public.questions (prompt, options, correct_option, explanation, topic)
 select * from (values

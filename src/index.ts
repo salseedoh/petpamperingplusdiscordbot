@@ -23,6 +23,7 @@ import { config } from './config.js';
 type Question = { id: string; prompt: string; options: string[]; correct_option: number; explanation: string; topic: string | null; image_filename: string | null };
 type Session = { id: string; question_id: string; kind: 'trivia' | 'quiz' | 'daily' | 'test'; guild_id: string; channel_id: string; message_id: string | null; owner_discord_user_id: string | null; quiz_run_id: string | null; daily_date: string | null; expires_at: string | null };
 type PrivateInteraction = ChatInputCommandInteraction | ButtonInteraction;
+type AwardResult = { correct: boolean; alreadyAnswered: boolean; dailyStreak: number | null; correctAnswerMilestone: number | null; streakMilestone: number | null };
 
 const supabase = createClient(config.supabaseUrl, config.supabaseSecretKey, {
   auth: { autoRefreshToken: false, persistSession: false }
@@ -43,6 +44,30 @@ function previousCentralDate(): string {
   const date = new Date(`${todayCentral()}T12:00:00Z`);
   date.setUTCDate(date.getUTCDate() - 1);
   return date.toISOString().slice(0, 10);
+}
+
+function currentCentralMonth(): string {
+  return todayCentral().slice(0, 7);
+}
+
+function currentCentralMonthLabel(): string {
+  return new Intl.DateTimeFormat('en-US', { timeZone: config.timezone, month: 'long', year: 'numeric' }).format(new Date());
+}
+
+function centralMonthBounds(): { start: string; end: string } {
+  const [yearText, monthText] = currentCentralMonth().split('-');
+  const year = Number(yearText);
+  const monthIndex = Number(monthText) - 1;
+  // The database query intentionally includes a small UTC buffer. Results are
+  // then filtered using the configured Central timezone, including DST changes.
+  return {
+    start: new Date(Date.UTC(year, monthIndex, 1)).toISOString(),
+    end: new Date(Date.UTC(year, monthIndex + 1, 2)).toISOString()
+  };
+}
+
+function monthCentral(timestamp: string): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: config.timezone }).format(new Date(timestamp)).slice(0, 7);
 }
 
 function questionEmbed(question: Question, heading = '🐾 Pet First Aid Question'): EmbedBuilder {
@@ -215,27 +240,43 @@ function isAdmin(interaction: ChatInputCommandInteraction): boolean {
   return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ?? false;
 }
 
-async function awardAnswer(session: Session, question: Question, interaction: ButtonInteraction, selected: number): Promise<{ correct: boolean; alreadyAnswered: boolean; dailyStreak: number | null }> {
+async function correctAnswerCount(discordUserId: string): Promise<number> {
+  const { count, error } = await supabase.from('question_answers').select('*', { count: 'exact', head: true }).eq('discord_user_id', discordUserId).eq('is_correct', true);
+  if (error) throw error;
+  return count ?? 0;
+}
+
+async function claimMilestone(discordUserId: string, kind: 'correct_answers' | 'daily_streak', milestoneValue: number): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('employee_milestones')
+    .upsert({ discord_user_id: discordUserId, kind, milestone_value: milestoneValue }, { onConflict: 'discord_user_id,kind,milestone_value', ignoreDuplicates: true })
+    .select('milestone_value');
+  if (error) throw error;
+  return (data?.length ?? 0) > 0;
+}
+
+async function awardAnswer(session: Session, question: Question, interaction: ButtonInteraction, selected: number): Promise<AwardResult> {
   if (session.owner_discord_user_id && session.owner_discord_user_id !== interaction.user.id) {
     await interaction.editReply({ content: 'This question belongs to another employee.' });
-    return { correct: false, alreadyAnswered: true, dailyStreak: null };
+    return { correct: false, alreadyAnswered: true, dailyStreak: null, correctAnswerMilestone: null, streakMilestone: null };
   }
   if (session.kind === 'daily' && session.daily_date !== todayCentral()) {
     await interaction.editReply({ content: 'This question has expired.' });
-    return { correct: false, alreadyAnswered: true, dailyStreak: null };
+    return { correct: false, alreadyAnswered: true, dailyStreak: null, correctAnswerMilestone: null, streakMilestone: null };
   }
   const correct = selected === question.correct_option;
   if (session.kind === 'test') {
-    return { correct, alreadyAnswered: false, dailyStreak: null };
+    return { correct, alreadyAnswered: false, dailyStreak: null, correctAnswerMilestone: null, streakMilestone: null };
   }
+  const pointsAwarded = correct ? (session.kind === 'daily' ? 10 : 1) : 0;
   const { error: answerError } = await supabase.from('question_answers').insert({
     session_id: session.id, discord_user_id: interaction.user.id, selected_option: selected,
-    is_correct: correct, points_awarded: correct ? 10 : 0
+    is_correct: correct, points_awarded: pointsAwarded
   });
   if (answerError) {
     if (answerError.code === '23505') await interaction.editReply({ content: 'You have already answered this question.' });
     else throw answerError;
-    return { correct, alreadyAnswered: true, dailyStreak: null };
+    return { correct, alreadyAnswered: true, dailyStreak: null, correctAnswerMilestone: null, streakMilestone: null };
   }
 
   const { data: profile } = await supabase.from('employee_profiles').select('*').eq('discord_user_id', interaction.user.id).maybeSingle();
@@ -251,13 +292,26 @@ async function awardAnswer(session: Session, question: Question, interaction: Bu
   const { error: profileError } = await supabase.from('employee_profiles').upsert({
     discord_user_id: interaction.user.id,
     display_name: interaction.user.globalName ?? interaction.user.username,
-    total_points: (profile?.total_points ?? 0) + (correct ? 10 : 0),
+    total_points: (profile?.total_points ?? 0) + pointsAwarded,
     daily_streak: streak,
     last_daily_date: dailyDate ?? profile?.last_daily_date ?? null,
     updated_at: new Date().toISOString()
   });
   if (profileError) throw profileError;
-  return { correct, alreadyAnswered: false, dailyStreak: dailyDate ? streak : null };
+  let correctAnswerMilestone: number | null = null;
+  let streakMilestone: number | null = null;
+  if (correct) {
+    const totalCorrect = await correctAnswerCount(interaction.user.id);
+    const completedCorrectMilestone = Math.floor(totalCorrect / 25) * 25;
+    if (completedCorrectMilestone > 0 && await claimMilestone(interaction.user.id, 'correct_answers', completedCorrectMilestone)) {
+      correctAnswerMilestone = completedCorrectMilestone;
+    }
+    const completedStreakMilestone = Math.floor(streak / 7) * 7;
+    if (dailyDate && completedStreakMilestone > 0 && await claimMilestone(interaction.user.id, 'daily_streak', completedStreakMilestone)) {
+      streakMilestone = completedStreakMilestone;
+    }
+  }
+  return { correct, alreadyAnswered: false, dailyStreak: dailyDate ? streak : null, correctAnswerMilestone, streakMilestone };
 }
 
 async function answerButton(interaction: ButtonInteraction): Promise<void> {
@@ -276,10 +330,14 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
   const explanationSection = question.explanation.trim() ? `\n\n**Why:** ${question.explanation}` : '';
+  const milestoneSection = [
+    result.correctAnswerMilestone !== null ? `🎉 **Learning milestone:** ${result.correctAnswerMilestone} correct answers!` : null,
+    result.streakMilestone !== null ? `🔥 **Streak milestone:** ${result.streakMilestone} days!` : null
+  ].filter((value): value is string => value !== null).join('\n');
   const resultEmbed = new EmbedBuilder()
     .setColor(result.correct ? 0x38a169 : 0xe53e3e)
     .setTitle(result.correct ? '✅ Correct!' : '❌ Not quite')
-    .setDescription(`**${letters[question.correct_option]} — ${question.options[question.correct_option]}**${explanationSection}${session.kind === 'test' ? '\n\nTest mode — no points awarded.' : result.correct ? '\n\n+10 points' : ''}${result.dailyStreak !== null ? `\n\n🔥 **Daily streak:** ${result.dailyStreak} day${result.dailyStreak === 1 ? '' : 's'}` : ''}`);
+    .setDescription(`**${letters[question.correct_option]} — ${question.options[question.correct_option]}**${explanationSection}${session.kind === 'test' ? '\n\nTest mode — no points awarded.' : result.correct ? `\n\n+${session.kind === 'daily' ? 10 : 1} point${session.kind === 'daily' ? 's' : ''}` : ''}${result.dailyStreak !== null ? `\n\n🔥 **Daily streak:** ${result.dailyStreak} day${result.dailyStreak === 1 ? '' : 's'}` : ''}${milestoneSection ? `\n\n${milestoneSection}` : ''}`);
   if (session.kind === 'quiz' && session.quiz_run_id) {
     const { data: run, error: runError } = await supabase.from('quiz_runs').select('*').eq('id', session.quiz_run_id).single();
     if (runError || !run) throw new Error('Quiz run was not found.');
@@ -289,7 +347,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
     if (nextIndex >= questionIds.length) {
       const { error } = await supabase.from('quiz_runs').update({ current_index: nextIndex, correct_count: correctCount, completed_at: new Date().toISOString() }).eq('id', run.id);
       if (error) throw error;
-      resultEmbed.addFields({ name: 'Quiz complete', value: `You answered **${correctCount}/${QUIZ_QUESTION_COUNT}** correctly and earned **${correctCount * 10} points**.` });
+      resultEmbed.addFields({ name: 'Quiz complete', value: `You answered **${correctCount}/${QUIZ_QUESTION_COUNT}** correctly and earned **${correctCount} point${correctCount === 1 ? '' : 's'}**.` });
       await interaction.editReply({ embeds: [resultEmbed] });
       deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
       return;
@@ -360,17 +418,43 @@ async function dailyTriviaStatus(guildId: string, discordUserId: string): Promis
 }
 
 async function leaderboard(interaction: PrivateInteraction): Promise<void> {
-  const [leaderboardResult, dailyStatus] = await Promise.all([
+  const bounds = centralMonthBounds();
+  const [leaderboardResult, dailyStatus, correctCount, monthlyAnswersResult, allProfilesResult] = await Promise.all([
     supabase.from('employee_profiles').select('display_name,total_points,daily_streak').order('total_points', { ascending: false }).limit(10),
-    dailyTriviaStatus(interaction.guildId!, interaction.user.id)
+    dailyTriviaStatus(interaction.guildId!, interaction.user.id),
+    correctAnswerCount(interaction.user.id),
+    supabase.from('question_answers').select('discord_user_id,points_awarded,answered_at').gte('answered_at', bounds.start).lt('answered_at', bounds.end),
+    supabase.from('employee_profiles').select('discord_user_id,display_name,daily_streak')
   ]);
   const { data, error } = leaderboardResult;
   if (error) throw error;
+  if (monthlyAnswersResult.error) throw monthlyAnswersResult.error;
+  if (allProfilesResult.error) throw allProfilesResult.error;
+  const monthlyPoints = new Map<string, number>();
+  for (const answer of monthlyAnswersResult.data ?? []) {
+    if (monthCentral(answer.answered_at) !== currentCentralMonth() || answer.points_awarded <= 0) continue;
+    monthlyPoints.set(answer.discord_user_id, (monthlyPoints.get(answer.discord_user_id) ?? 0) + answer.points_awarded);
+  }
+  const displayNameByUser = new Map((allProfilesResult.data ?? []).map(profile => [profile.discord_user_id, profile.display_name]));
+  const monthlyText = monthlyPoints.size
+    ? [...monthlyPoints.entries()]
+      .sort(([, leftPoints], [, rightPoints]) => rightPoints - leftPoints)
+      .slice(0, 10)
+      .map(([discordUserId, points], index) => `**${index + 1}.** ${displayNameByUser.get(discordUserId) ?? 'Unknown employee'} — ${points} point${points === 1 ? '' : 's'}`)
+      .join('\n')
+    : 'No points have been earned this month.';
+  const currentStreak = (allProfilesResult.data ?? []).find(profile => profile.discord_user_id === interaction.user.id)?.daily_streak ?? 0;
+  const nextCorrectMilestone = (Math.floor(correctCount / 25) + 1) * 25;
+  const nextStreakMilestone = (Math.floor(currentStreak / 7) + 1) * 7;
   const text = data?.length ? data.map((row, index) => `**${index + 1}.** ${row.display_name} — ${row.total_points} points (${row.daily_streak}-day streak)`).join('\n') : 'No points have been earned yet.';
   await interaction.editReply({ embeds: [new EmbedBuilder()
     .setColor(0xd69e2e)
     .setTitle('🏆 Leaderboard')
-    .setDescription(text)
+    .setDescription(`**All-time leaderboard**\n${text}`)
+    .addFields(
+      { name: `Monthly leaderboard — ${currentCentralMonthLabel()}`, value: monthlyText },
+      { name: 'Your learning milestones', value: `Correct answers: **${correctCount}** · Next milestone: **${nextCorrectMilestone}**\nDaily streak: **${currentStreak} days** · Next milestone: **${nextStreakMilestone} days**` }
+    )
     .addFields({ name: 'Today’s daily trivia', value: dailyStatus })] });
 }
 
@@ -449,9 +533,15 @@ async function adminCommand(interaction: ChatInputCommandInteraction): Promise<v
   }
   if (interaction.commandName === 'reset_scores') {
     if (interaction.options.getString('confirm', true) !== 'RESET') return void await interaction.editReply({ content: 'Nothing changed. Type `RESET` exactly to confirm.' });
-    const { error } = await supabase.from('employee_profiles').update({ total_points: 0, daily_streak: 0, last_daily_date: null, updated_at: new Date().toISOString() }).neq('discord_user_id', '');
-    if (error) throw error;
-    return void await interaction.editReply({ content: 'All employee scores and streaks were reset.' });
+    const { error: answerError } = await supabase.from('question_answers').delete().not('id', 'is', null);
+    if (answerError) throw answerError;
+    const { error: milestoneError } = await supabase.from('employee_milestones').delete().not('id', 'is', null);
+    if (milestoneError) throw milestoneError;
+    const { error: quizError } = await supabase.from('quiz_runs').delete().not('id', 'is', null);
+    if (quizError) throw quizError;
+    const { error: profileError } = await supabase.from('employee_profiles').update({ total_points: 0, daily_streak: 0, last_daily_date: null, updated_at: new Date().toISOString() }).neq('discord_user_id', '');
+    if (profileError) throw profileError;
+    return void await interaction.editReply({ content: 'Scores, answer history, monthly standings, milestones, and unfinished quizzes were reset.' });
   }
   if (interaction.commandName === 'employee_stats') {
     const employee = interaction.options.getUser('employee');
