@@ -1,6 +1,10 @@
 import cron from 'node-cron';
+import { existsSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   Client,
@@ -16,8 +20,8 @@ import {
 import { createClient } from '@supabase/supabase-js';
 import { config } from './config.js';
 
-type Question = { id: string; prompt: string; options: string[]; correct_option: number; explanation: string; topic: string | null };
-type Session = { id: string; question_id: string; kind: 'trivia' | 'quiz' | 'daily'; guild_id: string; channel_id: string; message_id: string | null; owner_discord_user_id: string | null; quiz_run_id: string | null; daily_date: string | null; expires_at: string | null };
+type Question = { id: string; prompt: string; options: string[]; correct_option: number; explanation: string; topic: string | null; image_filename: string | null };
+type Session = { id: string; question_id: string; kind: 'trivia' | 'quiz' | 'daily' | 'test'; guild_id: string; channel_id: string; message_id: string | null; owner_discord_user_id: string | null; quiz_run_id: string | null; daily_date: string | null; expires_at: string | null };
 type PrivateInteraction = ChatInputCommandInteraction | ButtonInteraction;
 
 const supabase = createClient(config.supabaseUrl, config.supabaseSecretKey, {
@@ -29,6 +33,7 @@ const QUESTION_EXPIRY_MS = 10 * 60 * 1000;
 const VIEW_EXPIRY_MS = 5 * 60 * 1000;
 const SHORT_EXPIRY_MS = 60 * 1000;
 const QUIZ_QUESTION_COUNT = 5;
+const questionImageDirectory = fileURLToPath(new URL('../assets/questions/', import.meta.url));
 
 function todayCentral(): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: config.timezone }).format(new Date());
@@ -41,10 +46,28 @@ function previousCentralDate(): string {
 }
 
 function questionEmbed(question: Question, heading = '🐾 Pet First Aid Question'): EmbedBuilder {
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(0x2f855a)
     .setTitle(heading)
     .setDescription(`${question.prompt}\n\n${question.options.map((option, index) => `**${letters[index]}.** ${option}`).join('\n')}\n\nSelect an option below.`);
+  const image = questionImage(question);
+  if (image) embed.setImage(`attachment://${image.filename}`);
+  return embed;
+}
+
+function questionImage(question: Question): { path: string; filename: string } | null {
+  if (!question.image_filename || basename(question.image_filename) !== question.image_filename) return null;
+  const path = join(questionImageDirectory, question.image_filename);
+  if (!existsSync(path)) {
+    console.warn(`Question image is missing: ${question.image_filename}`);
+    return null;
+  }
+  return { path, filename: question.image_filename };
+}
+
+function questionFiles(question: Question): AttachmentBuilder[] {
+  const image = questionImage(question);
+  return image ? [new AttachmentBuilder(image.path, { name: image.filename })] : [];
 }
 
 function questionButtons(sessionId: string, optionCount: number, disabled = false): ActionRowBuilder<ButtonBuilder> {
@@ -143,7 +166,7 @@ async function postDailyQuestion(): Promise<boolean> {
     question = randomQuestion(questions);
     session = await createSession(question, 'daily', config.guildId, config.dailyChannelId, null, dailyDate);
   }
-  const message = await channel.send({ embeds: [questionEmbed(question, '🐾 Daily Pet First Aid Question')], components: [questionButtons(session.id, question.options.length)] });
+  const message = await channel.send({ embeds: [questionEmbed(question, '🐾 Daily Pet First Aid Question')], components: [questionButtons(session.id, question.options.length)], files: questionFiles(question) });
   const { error } = await supabase.from('question_sessions').update({ message_id: message.id, channel_id: config.dailyChannelId }).eq('id', session.id);
   if (error) throw error;
   return true;
@@ -202,6 +225,9 @@ async function awardAnswer(session: Session, question: Question, interaction: Bu
     return { correct: false, alreadyAnswered: true, dailyStreak: null };
   }
   const correct = selected === question.correct_option;
+  if (session.kind === 'test') {
+    return { correct, alreadyAnswered: false, dailyStreak: null };
+  }
   const { error: answerError } = await supabase.from('question_answers').insert({
     session_id: session.id, discord_user_id: interaction.user.id, selected_option: selected,
     is_correct: correct, points_awarded: correct ? 10 : 0
@@ -253,7 +279,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
   const resultEmbed = new EmbedBuilder()
     .setColor(result.correct ? 0x38a169 : 0xe53e3e)
     .setTitle(result.correct ? '✅ Correct!' : '❌ Not quite')
-    .setDescription(`**${letters[question.correct_option]} — ${question.options[question.correct_option]}**${explanationSection}${result.correct ? '\n\n+10 points' : ''}${result.dailyStreak !== null ? `\n\n🔥 **Daily streak:** ${result.dailyStreak} day${result.dailyStreak === 1 ? '' : 's'}` : ''}`);
+    .setDescription(`**${letters[question.correct_option]} — ${question.options[question.correct_option]}**${explanationSection}${session.kind === 'test' ? '\n\nTest mode — no points awarded.' : result.correct ? '\n\n+10 points' : ''}${result.dailyStreak !== null ? `\n\n🔥 **Daily streak:** ${result.dailyStreak} day${result.dailyStreak === 1 ? '' : 's'}` : ''}`);
   if (session.kind === 'quiz' && session.quiz_run_id) {
     const { data: run, error: runError } = await supabase.from('quiz_runs').select('*').eq('id', session.quiz_run_id).single();
     if (runError || !run) throw new Error('Quiz run was not found.');
@@ -275,7 +301,7 @@ async function answerButton(interaction: ButtonInteraction): Promise<void> {
     const nextQuestion = nextQuestionData as Question;
     const nextSession = await createSession(nextQuestion, 'quiz', session.guild_id, interaction.channelId, interaction.user.id, null, run.id);
     await interaction.editReply({ embeds: [resultEmbed] });
-    const nextQuestionMessage = await interaction.followUp({ embeds: [questionEmbed(nextQuestion, `🐾 Quiz Question ${nextIndex + 1} of ${QUIZ_QUESTION_COUNT}`)], components: [questionButtons(nextSession.id, nextQuestion.options.length)], ephemeral: true });
+    const nextQuestionMessage = await interaction.followUp({ embeds: [questionEmbed(nextQuestion, `🐾 Quiz Question ${nextIndex + 1} of ${QUIZ_QUESTION_COUNT}`)], components: [questionButtons(nextSession.id, nextQuestion.options.length)], files: questionFiles(nextQuestion), ephemeral: true });
     deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
     deleteReplyAfter(interaction, QUESTION_EXPIRY_MS, nextQuestionMessage.id);
     return;
@@ -293,7 +319,7 @@ async function startTrivia(interaction: PrivateInteraction): Promise<void> {
   }
   const question = randomQuestion(questions);
   const session = await createSession(question, 'trivia', interaction.guildId!, interaction.channelId, interaction.user.id);
-  await interaction.editReply({ embeds: [questionEmbed(question)], components: [questionButtons(session.id, question.options.length)] });
+  await interaction.editReply({ embeds: [questionEmbed(question)], components: [questionButtons(session.id, question.options.length)], files: questionFiles(question) });
   deleteReplyAfter(interaction, QUESTION_EXPIRY_MS);
 }
 
@@ -308,7 +334,7 @@ async function startQuiz(interaction: PrivateInteraction): Promise<void> {
   const { data: run, error } = await supabase.from('quiz_runs').insert({ discord_user_id: interaction.user.id, guild_id: interaction.guildId, question_ids: chosen.map(question => question.id) }).select().single();
   if (error) throw error;
   const session = await createSession(chosen[0], 'quiz', interaction.guildId!, interaction.channelId, interaction.user.id, null, run.id);
-  await interaction.editReply({ embeds: [questionEmbed(chosen[0], `🐾 Quiz Question 1 of ${QUIZ_QUESTION_COUNT}`)], components: [questionButtons(session.id, chosen[0].options.length)] });
+  await interaction.editReply({ embeds: [questionEmbed(chosen[0], `🐾 Quiz Question 1 of ${QUIZ_QUESTION_COUNT}`)], components: [questionButtons(session.id, chosen[0].options.length)], files: questionFiles(chosen[0]) });
   deleteReplyAfter(interaction, QUESTION_EXPIRY_MS);
 }
 
@@ -381,7 +407,11 @@ async function adminCommand(interaction: ChatInputCommandInteraction): Promise<v
     if (correctOption >= options.length) {
       return void await interaction.editReply({ content: 'The correct-answer number must match one of the choices you provided.' });
     }
-    const { data, error } = await supabase.from('questions').insert({ prompt: interaction.options.getString('prompt', true), options, correct_option: correctOption, explanation: interaction.options.getString('why') ?? '', topic: interaction.options.getString('topic') }).select('id').single();
+    const imageFilename = interaction.options.getString('image');
+    if (imageFilename && basename(imageFilename) !== imageFilename) {
+      return void await interaction.editReply({ content: 'The image must be a filename only, such as `DogAnatomy.png`.' });
+    }
+    const { data, error } = await supabase.from('questions').insert({ prompt: interaction.options.getString('prompt', true), options, correct_option: correctOption, explanation: interaction.options.getString('why') ?? '', topic: interaction.options.getString('topic'), image_filename: imageFilename }).select('id').single();
     if (error) throw error;
     return void await interaction.editReply({ content: `Question added: \`${data.id}\`` });
   }
@@ -400,6 +430,15 @@ async function adminCommand(interaction: ChatInputCommandInteraction): Promise<v
   if (interaction.commandName === 'postdaily') {
     const posted = await ensureDailyQuestion('administrator request');
     return void await interaction.editReply({ content: posted ? 'Today\'s daily question was posted in the daily channel.' : 'Today already has a daily question.' });
+  }
+  if (interaction.commandName === 'testquestion') {
+    const { data: questionData, error } = await supabase.from('questions').select('*').eq('id', interaction.options.getString('id', true)).single();
+    if (error || !questionData) return void await interaction.editReply({ content: 'Question not found. Copy its ID from the Questions table in Supabase.' });
+    const question = questionData as Question;
+    const session = await createSession(question, 'test', interaction.guildId!, interaction.channelId, interaction.user.id);
+    await interaction.editReply({ embeds: [questionEmbed(question, '🧪 Test Question')], components: [questionButtons(session.id, question.options.length)], files: questionFiles(question) });
+    deleteReplyAfter(interaction, QUESTION_EXPIRY_MS);
+    return;
   }
   if (interaction.commandName === 'postmenu') {
     if (!interaction.channel?.isTextBased() || !('send' in interaction.channel)) {

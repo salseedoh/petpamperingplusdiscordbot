@@ -10,6 +10,7 @@ create table if not exists public.questions (
   correct_option smallint not null constraint questions_correct_option_range_check check (correct_option >= 0 and correct_option < jsonb_array_length(options)),
   explanation text not null,
   topic text,
+  image_filename text,
   enabled boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -30,7 +31,7 @@ create table if not exists public.training_cards (
 create table if not exists public.question_sessions (
   id uuid primary key default gen_random_uuid(),
   question_id uuid not null references public.questions(id),
-  kind text not null check (kind in ('trivia', 'quiz', 'daily')),
+  kind text not null check (kind in ('trivia', 'quiz', 'daily', 'test')),
   guild_id text not null,
   channel_id text not null,
   message_id text,
@@ -75,6 +76,9 @@ create table if not exists public.quiz_runs (
 alter table public.question_sessions add column if not exists quiz_run_id uuid references public.quiz_runs(id) on delete cascade;
 alter table public.question_sessions add column if not exists message_id text;
 alter table public.training_cards add column if not exists sections jsonb not null default '[]'::jsonb;
+alter table public.questions add column if not exists image_filename text;
+alter table public.question_sessions drop constraint if exists question_sessions_kind_check;
+alter table public.question_sessions add constraint question_sessions_kind_check check (kind in ('trivia', 'quiz', 'daily', 'test'));
 
 -- Supports True/False (2 choices), standard four-choice, and five-choice questions.
 -- These statements also update databases created before variable choice counts were supported.

@@ -15,7 +15,8 @@ export const commands = [
     .addStringOption(option => option.setName('c').setDescription('Answer C (required for 4 or 5 choices).'))
     .addStringOption(option => option.setName('d').setDescription('Answer D (required for 4 or 5 choices).'))
     .addStringOption(option => option.setName('e').setDescription('Answer E (optional fifth choice).'))
-    .addStringOption(option => option.setName('topic').setDescription('Optional topic.')),
+    .addStringOption(option => option.setName('topic').setDescription('Optional topic.'))
+    .addStringOption(option => option.setName('image').setDescription('Optional image filename from assets/questions.')),
   new SlashCommandBuilder()
     .setName('editquestion').setDescription('Edit a question prompt or explanation.')
     .addStringOption(option => option.setName('id').setDescription('Question ID.').setRequired(true))
@@ -25,6 +26,7 @@ export const commands = [
   new SlashCommandBuilder().setName('disablequestion').setDescription('Disable a question.').addStringOption(option => option.setName('id').setDescription('Question ID.').setRequired(true)),
   new SlashCommandBuilder().setName('trainingreport').setDescription('Show training activity for this server.'),
   new SlashCommandBuilder().setName('postdaily').setDescription('Post today\'s daily question now.'),
+  new SlashCommandBuilder().setName('testquestion').setDescription('Privately test a specific question without scoring it.').addStringOption(option => option.setName('id').setDescription('Question ID from Supabase.').setRequired(true)),
   new SlashCommandBuilder().setName('postmenu').setDescription('Post the employee button menu in this channel.'),
   new SlashCommandBuilder().setName('employee_stats').setDescription('Show points and streaks.').addUserOption(option => option.setName('employee').setDescription('Optional employee.')),
   new SlashCommandBuilder().setName('reset_scores').setDescription('Reset every employee score and streak.').addStringOption(option => option.setName('confirm').setDescription('Type RESET to confirm.').setRequired(true))

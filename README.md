@@ -19,13 +19,15 @@ Leave the terminal open while the bot is meant to run. The daily question posts 
 ## Commands
 
 - Everyone: `/trivia`, `/quiz`, `/leaderboard`, `/learn`
-- Administrators: `/addquestion`, `/editquestion`, `/disablequestion`, `/trainingreport`, `/postdaily`, `/employee_stats`, `/reset_scores`
+- Administrators: `/addquestion`, `/editquestion`, `/disablequestion`, `/trainingreport`, `/postdaily`, `/testquestion`, `/employee_stats`, `/reset_scores`
 
 Correct answers earn 10 points. Daily streaks increase for each correct daily answer and reset after an incorrect or missed daily question. If the 6:00 AM daily post encounters a temporary network failure, the bot retries it and checks every 15 minutes through 11:45 AM Central until it succeeds.
 
 Private bot responses clean themselves up automatically: unanswered trivia and quiz questions after 10 minutes; answer results and administrator confirmations after 1 minute; and learning cards, leaderboards, and reports after 5 minutes. The daily question remains public until its scheduled midnight removal.
 
 Questions may have 2 choices (for True/False), 4 choices, or 5 choices. In the Supabase Table Editor, set `correct_option` using zero-based numbering: `0` is A, `1` is B, through `4` for E. Before adding True/False or five-choice questions to an existing database, run [`supabase/allow-variable-choice-counts.sql`](supabase/allow-variable-choice-counts.sql) once in Supabase SQL Editor.
+
+Questions can optionally show an image. Put the image in `assets/questions`, then set its filename in the `image_filename` database column or the optional `image` field of `/addquestion`. Use `/testquestion` with a question ID to privately test a question without awarding points or changing scores, streaks, or training reports.
 
 ## Content status
 
