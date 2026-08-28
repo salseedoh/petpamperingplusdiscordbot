@@ -21,7 +21,7 @@ Leave the terminal open while the bot is meant to run. The daily question posts 
 - Everyone: `/trivia`, `/quiz`, `/leaderboard`, `/learn`
 - Administrators: `/addquestion`, `/editquestion`, `/disablequestion`, `/trainingreport`, `/postdaily`, `/testquestion`, `/employee_stats`, `/reset_scores`
 
-A correct daily answer earns 10 points. Correct practice answers from Trivia and Quiz earn 1 point each. Daily streaks increase for each correct daily answer and reset after an incorrect or missed daily question. The private leaderboard includes all-time and current-month standings, your daily-trivia status, and progress toward learning milestones (every 25 correct answers and every 7 streak days). If the 6:00 AM daily post encounters a temporary network failure, the bot retries it and checks every 15 minutes through 11:45 AM Central until it succeeds.
+A correct daily answer earns 10 points. Correct practice answers from Trivia and Quiz earn 1 point each. Daily streaks increase for each correct daily answer and reset after an incorrect or missed daily question. Daily questions rotate through every enabled question before beginning a new rotation. The private leaderboard includes all-time and current-month standings, your daily-trivia status, and progress toward learning milestones (every 25 correct answers and every 7 streak days). If the 6:00 AM daily post encounters a temporary network failure, the bot retries it and checks every 15 minutes through 11:45 AM Central until it succeeds.
 
 Private bot responses clean themselves up automatically: unanswered trivia and quiz questions after 10 minutes; answer results and administrator confirmations after 1 minute; and learning cards, leaderboards, and reports after 5 minutes. The daily question remains public until its scheduled midnight removal.
 
@@ -31,4 +31,4 @@ Questions can optionally show an image. Put the image in `assets/questions`, the
 
 ## Content status
 
-The database script includes three non-pet placeholder questions and two placeholder training cards, exactly for initial setup testing. `/quiz` becomes available when at least ten approved active questions have been added.
+The database script includes three non-pet placeholder questions and two placeholder training cards, exactly for initial setup testing. `/quiz` becomes available when at least five approved active questions have been added.

@@ -42,6 +42,12 @@ create table if not exists public.question_sessions (
   unique (guild_id, daily_date)
 );
 
+create table if not exists public.daily_question_rotations (
+  guild_id text primary key,
+  used_question_ids jsonb not null default '[]'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists public.question_answers (
   id uuid primary key default gen_random_uuid(),
   session_id uuid not null references public.question_sessions(id) on delete cascade,
@@ -103,6 +109,7 @@ alter table public.question_answers add constraint question_answers_selected_opt
 alter table public.questions enable row level security;
 alter table public.training_cards enable row level security;
 alter table public.question_sessions enable row level security;
+alter table public.daily_question_rotations enable row level security;
 alter table public.question_answers enable row level security;
 alter table public.employee_profiles enable row level security;
 alter table public.quiz_runs enable row level security;
@@ -116,6 +123,7 @@ grant usage, select on all sequences in schema public to service_role;
 
 create index if not exists question_answers_correct_user_idx on public.question_answers (discord_user_id) where is_correct;
 create index if not exists question_answers_answered_at_idx on public.question_answers (answered_at);
+create index if not exists question_sessions_daily_history_idx on public.question_sessions (guild_id, kind, question_id) where kind = 'daily';
 
 insert into public.questions (prompt, options, correct_option, explanation, topic)
 select * from (values

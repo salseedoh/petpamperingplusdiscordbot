@@ -126,6 +126,42 @@ function randomQuestion(questions: Question[]): Question {
   return questions[Math.floor(Math.random() * questions.length)];
 }
 
+type DailyRotation = { used_question_ids: string[] };
+
+async function nextDailyQuestion(questions: Question[]): Promise<{ question: Question; usedQuestionIds: string[] }> {
+  const rotation = await retrySupabase<DailyRotation | null>('daily rotation state', () =>
+    supabase.from('daily_question_rotations').select('used_question_ids').eq('guild_id', config.guildId).maybeSingle()
+  );
+  const activeIds = new Set(questions.map(question => question.id));
+  let usedQuestionIds: string[];
+  if (rotation) {
+    usedQuestionIds = rotation.used_question_ids.filter(questionId => activeIds.has(questionId));
+  } else {
+    const history = await retrySupabase<Array<{ question_id: string }>>('daily rotation history', () =>
+      supabase.from('question_sessions').select('question_id').eq('guild_id', config.guildId).eq('kind', 'daily')
+    );
+    usedQuestionIds = history.map(session => session.question_id).filter(questionId => activeIds.has(questionId));
+  }
+  let candidates = questions.filter(question => !usedQuestionIds.includes(question.id));
+  if (!candidates.length) {
+    // Every active question has appeared: begin a new random rotation.
+    usedQuestionIds = [];
+    candidates = questions;
+  }
+  const question = randomQuestion(candidates);
+  return { question, usedQuestionIds: [...usedQuestionIds, question.id] };
+}
+
+async function saveDailyRotation(usedQuestionIds: string[]): Promise<void> {
+  await retrySupabase('save daily rotation state', () =>
+    supabase.from('daily_question_rotations').upsert({
+      guild_id: config.guildId,
+      used_question_ids: usedQuestionIds,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'guild_id' })
+  );
+}
+
 async function createSession(question: Question, kind: Session['kind'], guildId: string, channelId: string, ownerId: string | null, dailyDate: string | null = null, quizRunId: string | null = null): Promise<Session> {
   const { data, error } = await supabase.from('question_sessions').insert({
     question_id: question.id, kind, guild_id: guildId, channel_id: channelId,
@@ -139,22 +175,38 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
+function errorDetails(error: unknown): Record<string, unknown> {
+  if (!error || typeof error !== 'object') return { message: String(error) };
+  const value = error as Record<string, unknown>;
+  const cause = value.cause && typeof value.cause === 'object' ? value.cause as Record<string, unknown> : null;
+  return {
+    name: value.name,
+    message: value.message,
+    code: value.code,
+    status: value.status,
+    details: value.details,
+    hint: value.hint,
+    cause: cause?.message
+  };
+}
+
 function deleteReplyAfter(interaction: { deleteReply: (message?: string) => Promise<unknown> }, milliseconds: number, messageId?: string): void {
   const timer = setTimeout(() => {
-    void interaction.deleteReply(messageId).catch(error => console.warn('Could not remove an expired private response:', error));
+    void retry('Private response cleanup', () => interaction.deleteReply(messageId), 3, attempt => attempt * 15_000)
+      .catch(error => console.warn('Could not remove an expired private response after retries:', errorDetails(error)));
   }, milliseconds);
   timer.unref();
 }
 
 function isRetriableError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return true;
-  const status = (error as { status?: unknown }).status;
+  const { status, code } = error as { status?: unknown; code?: unknown };
   // Client-side Discord and Supabase errors (such as missing permissions) will
   // not succeed after a retry. Network failures and server errors may recover.
-  return typeof status !== 'number' || status === 408 || status === 429 || status >= 500;
+  return code === 'PGRST303' || typeof status !== 'number' || status === 408 || status === 429 || status >= 500;
 }
 
-async function retry<T>(label: string, operation: () => Promise<T>, attempts = 4): Promise<T> {
+async function retry<T>(label: string, operation: () => Promise<T>, attempts = 4, retryDelay: (attempt: number) => number = attempt => attempt * 60_000): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
@@ -162,12 +214,23 @@ async function retry<T>(label: string, operation: () => Promise<T>, attempts = 4
     } catch (error) {
       lastError = error;
       if (attempt === attempts || !isRetriableError(error)) break;
-      const delay = attempt * 60_000;
-      console.warn(`${label} failed (attempt ${attempt}/${attempts}); retrying in ${delay / 60_000} minute(s).`, error);
+      const delay = retryDelay(attempt);
+      console.warn(`${label} failed (attempt ${attempt}/${attempts}); retrying in ${Math.ceil(delay / 1000)} second(s).`, errorDetails(error));
       await wait(delay);
     }
   }
   throw lastError;
+}
+
+async function retrySupabase<T>(label: string, operation: () => PromiseLike<{ data: T | null; error: unknown }>): Promise<T> {
+  return retry(`Supabase request: ${label}`, async () => {
+    const { data, error } = await operation();
+    if (error) {
+      console.warn(`Supabase request failed: ${label}`, errorDetails(error));
+      throw error;
+    }
+    return data as T;
+  }, 3, attempt => attempt === 1 ? 1_000 : 3_000);
 }
 
 async function postDailyQuestion(): Promise<boolean> {
@@ -188,8 +251,10 @@ async function postDailyQuestion(): Promise<boolean> {
   } else {
     const questions = await activeQuestions();
     if (!questions.length) throw new Error('No enabled questions are available for the daily question.');
-    question = randomQuestion(questions);
+    const dailyChoice = await nextDailyQuestion(questions);
+    question = dailyChoice.question;
     session = await createSession(question, 'daily', config.guildId, config.dailyChannelId, null, dailyDate);
+    await saveDailyRotation(dailyChoice.usedQuestionIds);
   }
   const message = await channel.send({ embeds: [questionEmbed(question, '🐾 Daily Pet First Aid Question')], components: [questionButtons(session.id, question.options.length)], files: questionFiles(question) });
   const { error } = await supabase.from('question_sessions').update({ message_id: message.id, channel_id: config.dailyChannelId }).eq('id', session.id);
@@ -241,9 +306,15 @@ function isAdmin(interaction: ChatInputCommandInteraction): boolean {
 }
 
 async function correctAnswerCount(discordUserId: string): Promise<number> {
-  const { count, error } = await supabase.from('question_answers').select('*', { count: 'exact', head: true }).eq('discord_user_id', discordUserId).eq('is_correct', true);
-  if (error) throw error;
-  return count ?? 0;
+  const result = await retry('Supabase request: correct-answer count', async () => {
+    const { count, error } = await supabase.from('question_answers').select('*', { count: 'exact', head: true }).eq('discord_user_id', discordUserId).eq('is_correct', true);
+    if (error) {
+      console.warn('Supabase request failed: correct-answer count', errorDetails(error));
+      throw error;
+    }
+    return count ?? 0;
+  }, 3, attempt => attempt === 1 ? 1_000 : 3_000);
+  return result;
 }
 
 async function claimMilestone(discordUserId: string, kind: 'correct_answers' | 'daily_streak', milestoneValue: number): Promise<boolean> {
@@ -397,45 +468,49 @@ async function startQuiz(interaction: PrivateInteraction): Promise<void> {
 }
 
 async function dailyTriviaStatus(guildId: string, discordUserId: string): Promise<string> {
-  const { data: session, error: sessionError } = await supabase
-    .from('question_sessions')
-    .select('id')
-    .eq('kind', 'daily')
-    .eq('guild_id', guildId)
-    .eq('daily_date', todayCentral())
-    .maybeSingle();
-  if (sessionError) throw sessionError;
+  const session = await retrySupabase<{ id: string } | null>('leaderboard: today’s daily session', () =>
+    supabase
+      .from('question_sessions')
+      .select('id')
+      .eq('kind', 'daily')
+      .eq('guild_id', guildId)
+      .eq('daily_date', todayCentral())
+      .maybeSingle()
+  );
   if (!session) return '⌛ Not posted yet';
 
-  const { data: answer, error: answerError } = await supabase
-    .from('question_answers')
-    .select('id')
-    .eq('session_id', session.id)
-    .eq('discord_user_id', discordUserId)
-    .maybeSingle();
-  if (answerError) throw answerError;
+  const answer = await retrySupabase<{ id: string } | null>('leaderboard: today’s daily answer', () =>
+    supabase
+      .from('question_answers')
+      .select('id')
+      .eq('session_id', session.id)
+      .eq('discord_user_id', discordUserId)
+      .maybeSingle()
+  );
   return answer ? '✅ Completed today' : '⏳ Not completed today';
 }
 
 async function leaderboard(interaction: PrivateInteraction): Promise<void> {
   const bounds = centralMonthBounds();
-  const [leaderboardResult, dailyStatus, correctCount, monthlyAnswersResult, allProfilesResult] = await Promise.all([
-    supabase.from('employee_profiles').select('display_name,total_points,daily_streak').order('total_points', { ascending: false }).limit(10),
+  const [allTimeProfiles, dailyStatus, correctCount, monthlyAnswers, allProfiles] = await Promise.all([
+    retrySupabase<Array<{ display_name: string; total_points: number; daily_streak: number }>>('leaderboard: all-time profiles', () =>
+      supabase.from('employee_profiles').select('display_name,total_points,daily_streak').order('total_points', { ascending: false }).limit(10)
+    ),
     dailyTriviaStatus(interaction.guildId!, interaction.user.id),
     correctAnswerCount(interaction.user.id),
-    supabase.from('question_answers').select('discord_user_id,points_awarded,answered_at').gte('answered_at', bounds.start).lt('answered_at', bounds.end),
-    supabase.from('employee_profiles').select('discord_user_id,display_name,daily_streak')
+    retrySupabase<Array<{ discord_user_id: string; points_awarded: number; answered_at: string }>>('leaderboard: monthly answers', () =>
+      supabase.from('question_answers').select('discord_user_id,points_awarded,answered_at').gte('answered_at', bounds.start).lt('answered_at', bounds.end)
+    ),
+    retrySupabase<Array<{ discord_user_id: string; display_name: string; daily_streak: number }>>('leaderboard: employee names and streaks', () =>
+      supabase.from('employee_profiles').select('discord_user_id,display_name,daily_streak')
+    )
   ]);
-  const { data, error } = leaderboardResult;
-  if (error) throw error;
-  if (monthlyAnswersResult.error) throw monthlyAnswersResult.error;
-  if (allProfilesResult.error) throw allProfilesResult.error;
   const monthlyPoints = new Map<string, number>();
-  for (const answer of monthlyAnswersResult.data ?? []) {
+  for (const answer of monthlyAnswers ?? []) {
     if (monthCentral(answer.answered_at) !== currentCentralMonth() || answer.points_awarded <= 0) continue;
     monthlyPoints.set(answer.discord_user_id, (monthlyPoints.get(answer.discord_user_id) ?? 0) + answer.points_awarded);
   }
-  const displayNameByUser = new Map((allProfilesResult.data ?? []).map(profile => [profile.discord_user_id, profile.display_name]));
+  const displayNameByUser = new Map((allProfiles ?? []).map(profile => [profile.discord_user_id, profile.display_name]));
   const monthlyText = monthlyPoints.size
     ? [...monthlyPoints.entries()]
       .sort(([, leftPoints], [, rightPoints]) => rightPoints - leftPoints)
@@ -443,10 +518,10 @@ async function leaderboard(interaction: PrivateInteraction): Promise<void> {
       .map(([discordUserId, points], index) => `**${index + 1}.** ${displayNameByUser.get(discordUserId) ?? 'Unknown employee'} — ${points} point${points === 1 ? '' : 's'}`)
       .join('\n')
     : 'No points have been earned this month.';
-  const currentStreak = (allProfilesResult.data ?? []).find(profile => profile.discord_user_id === interaction.user.id)?.daily_streak ?? 0;
+  const currentStreak = (allProfiles ?? []).find(profile => profile.discord_user_id === interaction.user.id)?.daily_streak ?? 0;
   const nextCorrectMilestone = (Math.floor(correctCount / 25) + 1) * 25;
   const nextStreakMilestone = (Math.floor(currentStreak / 7) + 1) * 7;
-  const text = data?.length ? data.map((row, index) => `**${index + 1}.** ${row.display_name} — ${row.total_points} points (${row.daily_streak}-day streak)`).join('\n') : 'No points have been earned yet.';
+  const text = allTimeProfiles?.length ? allTimeProfiles.map((row, index) => `**${index + 1}.** ${row.display_name} — ${row.total_points} points (${row.daily_streak}-day streak)`).join('\n') : 'No points have been earned yet.';
   await interaction.editReply({ embeds: [new EmbedBuilder()
     .setColor(0xd69e2e)
     .setTitle('🏆 Leaderboard')
@@ -596,7 +671,7 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
       deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
     }
   } catch (error) {
-    console.error(error);
+    console.error('Interaction failed:', errorDetails(error));
     try {
       if (interaction.isRepliable() && interaction.deferred) {
         await interaction.editReply({ content: 'Something went wrong. Please try again or ask an administrator to check the bot log.' });
@@ -608,7 +683,7 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     } catch (responseError) {
       // A network outage can prevent both the original acknowledgement and this fallback response.
       // Log that separately, but keep the bot running for its scheduled retries and later commands.
-      console.error('Could not send the interaction error message:', responseError);
+      console.error('Could not send the interaction error message:', errorDetails(responseError));
     }
   }
 }
