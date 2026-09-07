@@ -1,5 +1,5 @@
 import cron from 'node-cron';
-import { existsSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -24,6 +24,16 @@ type Question = { id: string; prompt: string; options: string[]; correct_option:
 type Session = { id: string; question_id: string; kind: 'trivia' | 'quiz' | 'daily' | 'test'; guild_id: string; channel_id: string; message_id: string | null; owner_discord_user_id: string | null; quiz_run_id: string | null; daily_date: string | null; expires_at: string | null };
 type PrivateInteraction = ChatInputCommandInteraction | ButtonInteraction;
 type AwardResult = { correct: boolean; alreadyAnswered: boolean; dailyStreak: number | null; correctAnswerMilestone: number | null; streakMilestone: number | null };
+type HealthStatus = {
+  state: 'starting' | 'online' | 'reconnecting';
+  lastUpdated: string;
+  lastHeartbeat: string;
+  lastDiscordConnection: string | null;
+  lastSupabaseSuccess: string | null;
+  lastDailyPost: string | null;
+  lastDailyCleanup: string | null;
+  lastError: string | null;
+};
 
 const supabase = createClient(config.supabaseUrl, config.supabaseSecretKey, {
   auth: { autoRefreshToken: false, persistSession: false }
@@ -35,6 +45,77 @@ const VIEW_EXPIRY_MS = 5 * 60 * 1000;
 const SHORT_EXPIRY_MS = 60 * 1000;
 const QUIZ_QUESTION_COUNT = 5;
 const questionImageDirectory = fileURLToPath(new URL('../assets/questions/', import.meta.url));
+const runtimeDirectory = fileURLToPath(new URL('../logs/', import.meta.url));
+const logFile = join(runtimeDirectory, 'pet-first-aid-bot.log');
+const healthFile = join(runtimeDirectory, 'bot-health.json');
+const healthPageFile = join(runtimeDirectory, 'bot-health.html');
+const alertCooldowns = new Map<string, number>();
+let schedulesRegistered = false;
+
+mkdirSync(runtimeDirectory, { recursive: true });
+
+const originalConsole = {
+  log: console.log.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console)
+};
+
+function logValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+function writeLog(level: 'INFO' | 'WARN' | 'ERROR', values: unknown[]): void {
+  try {
+    appendFileSync(logFile, `[${new Date().toISOString()}] ${level} ${values.map(logValue).join(' ')}\n`);
+  } catch {
+    // Logging must never prevent the bot from operating.
+  }
+}
+
+console.log = (...values: unknown[]) => { originalConsole.log(...values); writeLog('INFO', values); };
+console.warn = (...values: unknown[]) => { originalConsole.warn(...values); writeLog('WARN', values); };
+console.error = (...values: unknown[]) => { originalConsole.error(...values); writeLog('ERROR', values); };
+
+function loadHealth(): HealthStatus {
+  try {
+    return JSON.parse(readFileSync(healthFile, 'utf8')) as HealthStatus;
+  } catch {
+    const now = new Date().toISOString();
+    return { state: 'starting', lastUpdated: now, lastHeartbeat: now, lastDiscordConnection: null, lastSupabaseSuccess: null, lastDailyPost: null, lastDailyCleanup: null, lastError: null };
+  }
+}
+
+const previousHealth = loadHealth();
+const wasUnhealthyAtStartup = Date.now() - Date.parse(previousHealth.lastHeartbeat) > 10 * 60 * 1000;
+let health = previousHealth;
+
+function escapeHtml(value: string | null): string {
+  return (value ?? 'Not yet').replace(/[&<>'"]/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character] ?? character);
+}
+
+function writeHealthPage(): void {
+  const rows = [
+    ['Bot state', health.state],
+    ['Last heartbeat', health.lastHeartbeat],
+    ['Last Discord connection', health.lastDiscordConnection],
+    ['Last successful Supabase request', health.lastSupabaseSuccess],
+    ['Last daily post', health.lastDailyPost],
+    ['Last daily cleanup', health.lastDailyCleanup],
+    ['Last warning/error', health.lastError]
+  ].map(([label, value]) => `<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(value)}</td></tr>`).join('');
+  const color = health.state === 'online' ? '#237804' : health.state === 'reconnecting' ? '#ad6800' : '#a8071a';
+  writeFileSync(healthPageFile, `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>Pet First Aid Bot Health</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:32px;background:#f7f9fc;color:#1f2937}main{max-width:760px;background:white;border-radius:12px;padding:28px;box-shadow:0 2px 12px #0001}h1{margin-top:0}.state{color:${color};font-weight:700;text-transform:capitalize}table{border-collapse:collapse;width:100%}th,td{padding:12px;text-align:left;border-bottom:1px solid #e5e7eb}th{width:38%;color:#4b5563}p{color:#6b7280}</style></head><body><main><h1>Pet First Aid Bot Health</h1><p>Refreshes every minute while this page is open. If the last heartbeat is more than 10 minutes old, the bot may be offline.</p><p class="state">Status: ${escapeHtml(health.state)}</p><table>${rows}</table></main></body></html>`);
+}
+
+function updateHealth(change: Partial<HealthStatus>): void {
+  const now = new Date().toISOString();
+  health = { ...health, ...change, lastUpdated: now };
+  writeFileSync(healthFile, JSON.stringify(health, null, 2));
+  writeHealthPage();
+}
+
+updateHealth({ state: 'starting', lastHeartbeat: new Date().toISOString() });
 
 function todayCentral(): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: config.timezone }).format(new Date());
@@ -117,9 +198,9 @@ function employeeMenu(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<
 }
 
 async function activeQuestions(): Promise<Question[]> {
-  const { data, error } = await supabase.from('questions').select('*').eq('enabled', true);
-  if (error) throw error;
-  return (data ?? []) as Question[];
+  return await retrySupabase<Question[]>('active questions', () =>
+    supabase.from('questions').select('*').eq('enabled', true)
+  );
 }
 
 function randomQuestion(questions: Question[]): Question {
@@ -163,12 +244,12 @@ async function saveDailyRotation(usedQuestionIds: string[]): Promise<void> {
 }
 
 async function createSession(question: Question, kind: Session['kind'], guildId: string, channelId: string, ownerId: string | null, dailyDate: string | null = null, quizRunId: string | null = null): Promise<Session> {
-  const { data, error } = await supabase.from('question_sessions').insert({
-    question_id: question.id, kind, guild_id: guildId, channel_id: channelId,
-    owner_discord_user_id: ownerId, daily_date: dailyDate, quiz_run_id: quizRunId
-  }).select().single();
-  if (error) throw error;
-  return data as Session;
+  return await retrySupabase<Session>('create question session', () =>
+    supabase.from('question_sessions').insert({
+      question_id: question.id, kind, guild_id: guildId, channel_id: channelId,
+      owner_discord_user_id: ownerId, daily_date: dailyDate, quiz_run_id: quizRunId
+    }).select().single()
+  );
 }
 
 function wait(milliseconds: number): Promise<void> {
@@ -188,6 +269,10 @@ function errorDetails(error: unknown): Record<string, unknown> {
     hint: value.hint,
     cause: cause?.message
   };
+}
+
+function isUnknownDiscordMessage(error: unknown): boolean {
+  return !!error && typeof error === 'object' && (error as { code?: unknown }).code === 10008;
 }
 
 function deleteReplyAfter(interaction: { deleteReply: (message?: string) => Promise<unknown> }, milliseconds: number, messageId?: string): void {
@@ -213,6 +298,7 @@ async function retry<T>(label: string, operation: () => Promise<T>, attempts = 4
       return await operation();
     } catch (error) {
       lastError = error;
+      updateHealth({ lastError: `${label}: ${String(errorDetails(error).message ?? 'request failed')}` });
       if (attempt === attempts || !isRetriableError(error)) break;
       const delay = retryDelay(attempt);
       console.warn(`${label} failed (attempt ${attempt}/${attempts}); retrying in ${Math.ceil(delay / 1000)} second(s).`, errorDetails(error));
@@ -223,7 +309,7 @@ async function retry<T>(label: string, operation: () => Promise<T>, attempts = 4
 }
 
 async function retrySupabase<T>(label: string, operation: () => PromiseLike<{ data: T | null; error: unknown }>): Promise<T> {
-  return retry(`Supabase request: ${label}`, async () => {
+  const data = await retry(`Supabase request: ${label}`, async () => {
     const { data, error } = await operation();
     if (error) {
       console.warn(`Supabase request failed: ${label}`, errorDetails(error));
@@ -231,23 +317,42 @@ async function retrySupabase<T>(label: string, operation: () => PromiseLike<{ da
     }
     return data as T;
   }, 3, attempt => attempt === 1 ? 1_000 : 3_000);
+  updateHealth({ lastSupabaseSuccess: new Date().toISOString() });
+  return data;
+}
+
+async function notifyBotInfo(key: string, title: string, message: string, color = 0xd69e2e): Promise<void> {
+  if (!config.botInfoChannelId || !client.isReady()) return;
+  const lastSent = alertCooldowns.get(key) ?? 0;
+  if (Date.now() - lastSent < 30 * 60 * 1000) return;
+  alertCooldowns.set(key, Date.now());
+  try {
+    await retry(`Bot-info notice: ${key}`, async () => {
+      const channel = await client.channels.fetch(config.botInfoChannelId!);
+      if (!channel?.isTextBased() || !('send' in channel)) throw new Error('BOT_INFO_CHANNEL_ID must be a text channel.');
+      await channel.send({ embeds: [new EmbedBuilder().setColor(color).setTitle(title).setDescription(message).setTimestamp()] });
+    }, 3, attempt => attempt * 15_000);
+  } catch (error) {
+    console.warn('Could not send a bot-info notice:', errorDetails(error));
+  }
 }
 
 async function postDailyQuestion(): Promise<boolean> {
-  const channel = await client.channels.fetch(config.dailyChannelId);
+  const channel = await retry('Fetch daily channel', () => client.channels.fetch(config.dailyChannelId), 3, attempt => attempt * 15_000);
   if (!channel?.isTextBased() || !('send' in channel)) throw new Error('DAILY_CHANNEL_ID must be a text channel.');
   const dailyDate = todayCentral();
-  const { data: existing, error: existingError } = await supabase.from('question_sessions').select('*').eq('guild_id', config.guildId).eq('daily_date', dailyDate).maybeSingle();
-  if (existingError) throw existingError;
+  const existing = await retrySupabase<Session | null>('today\'s daily session', () =>
+    supabase.from('question_sessions').select('*').eq('guild_id', config.guildId).eq('daily_date', dailyDate).maybeSingle()
+  );
 
   let session: Session;
   let question: Question;
   if (existing) {
-    session = existing as Session;
+    session = existing;
     if (session.message_id) return false;
-    const { data: questionData, error: questionError } = await supabase.from('questions').select('*').eq('id', session.question_id).single();
-    if (questionError || !questionData) throw new Error('The saved daily question could not be found.');
-    question = questionData as Question;
+    question = await retrySupabase<Question>('saved daily question', () =>
+      supabase.from('questions').select('*').eq('id', session.question_id).single()
+    );
   } else {
     const questions = await activeQuestions();
     if (!questions.length) throw new Error('No enabled questions are available for the daily question.');
@@ -256,39 +361,89 @@ async function postDailyQuestion(): Promise<boolean> {
     session = await createSession(question, 'daily', config.guildId, config.dailyChannelId, null, dailyDate);
     await saveDailyRotation(dailyChoice.usedQuestionIds);
   }
-  const message = await channel.send({ embeds: [questionEmbed(question, '🐾 Daily Pet First Aid Question')], components: [questionButtons(session.id, question.options.length)], files: questionFiles(question) });
-  const { error } = await supabase.from('question_sessions').update({ message_id: message.id, channel_id: config.dailyChannelId }).eq('id', session.id);
-  if (error) throw error;
+  const message = await retry<{ id: string }>('Send daily question', async () => {
+    const sent = await channel.send({ embeds: [questionEmbed(question, '🐾 Daily Pet First Aid Question')], components: [questionButtons(session.id, question.options.length)], files: questionFiles(question) });
+    return { id: sent.id };
+  }, 3, attempt => attempt * 15_000);
+  await retrySupabase<void>('save daily message ID', () =>
+    supabase.from('question_sessions').update({ message_id: message.id, channel_id: config.dailyChannelId }).eq('id', session.id)
+  );
+  updateHealth({ lastDailyPost: new Date().toISOString() });
   return true;
 }
 
 async function ensureDailyQuestion(reason: string): Promise<boolean> {
-  const posted = await retry(`Daily question (${reason})`, () => postDailyQuestion());
-  if (posted) console.log(`Posted daily question (${reason}).`);
-  return posted;
+  try {
+    const posted = await retry(`Daily question (${reason})`, () => postDailyQuestion());
+    if (posted) {
+      console.log(`Posted daily question (${reason}).`);
+      if (reason !== 'scheduled time') await notifyBotInfo('daily-recovered', '✅ Daily question posted', `The daily question was posted through **${reason}**.`, 0x237804);
+    }
+    return posted;
+  } catch (error) {
+    await notifyBotInfo('daily-post-failed', '⚠️ Daily question was not posted', `The bot could not post today’s daily question during **${reason}**. It will keep trying while it is online.\n\nError: ${String(errorDetails(error).message ?? 'Unknown error')}`);
+    throw error;
+  }
 }
 
 async function expiredDailySessions(): Promise<Session[]> {
-  const { data, error } = await supabase.from('question_sessions').select('*').eq('kind', 'daily').eq('daily_date', previousCentralDate()).not('message_id', 'is', null);
-  if (error) throw error;
-  return (data ?? []) as Session[];
+  return await retrySupabase<Session[]>('expired daily sessions', () =>
+    supabase.from('question_sessions').select('*').eq('kind', 'daily').lt('daily_date', todayCentral()).not('message_id', 'is', null)
+  );
+}
+
+async function markExpiredDailyMessageCleaned(session: Session): Promise<void> {
+  try {
+    await retrySupabase<void>('clear already-removed daily message', () =>
+      supabase.from('question_sessions').update({ message_id: null }).eq('id', session.id)
+    );
+    updateHealth({ lastDailyCleanup: new Date().toISOString() });
+    console.log(`Expired daily message was already gone; cleared its stored message ID (${session.id}).`);
+  } catch (error) {
+    // The Discord message is already gone. Retaining the ID is harmless; a
+    // later health check can attempt to clear it again if Supabase was offline.
+    console.warn('Could not clear the stored ID for an already-removed daily message:', errorDetails(error));
+  }
 }
 
 async function disableExpiredDailyQuestions(): Promise<void> {
   for (const session of await expiredDailySessions()) {
-    const channel = await client.channels.fetch(session.channel_id);
-    if (!channel?.isTextBased() || !('messages' in channel)) continue;
-    const message = await channel.messages.fetch(session.message_id!);
-    await message.edit({ components: [] });
+    try {
+      await retry('Disable expired daily question', async () => {
+        const channel = await client.channels.fetch(session.channel_id);
+        if (!channel?.isTextBased() || !('messages' in channel)) return;
+        const message = await channel.messages.fetch(session.message_id!);
+        await message.edit({ components: [] });
+      }, 3, attempt => attempt * 15_000);
+    } catch (error) {
+      if (isUnknownDiscordMessage(error)) {
+        await markExpiredDailyMessageCleaned(session);
+        continue;
+      }
+      console.error('Could not disable expired daily question after retries:', errorDetails(error));
+      await notifyBotInfo('daily-disable-failed', '⚠️ Daily question buttons could not be disabled', `An expired daily question still has active buttons.\n\nError: ${String(errorDetails(error).message ?? 'Unknown error')}`);
+    }
   }
 }
 
 async function deleteExpiredDailyQuestions(): Promise<void> {
   for (const session of await expiredDailySessions()) {
-    const channel = await client.channels.fetch(session.channel_id);
-    if (!channel?.isTextBased() || !('messages' in channel)) continue;
-    const message = await channel.messages.fetch(session.message_id!);
-    await message.delete();
+    try {
+      await retry('Delete expired daily question', async () => {
+        const channel = await client.channels.fetch(session.channel_id);
+        if (!channel?.isTextBased() || !('messages' in channel)) return;
+        const message = await channel.messages.fetch(session.message_id!);
+        await message.delete();
+      }, 3, attempt => attempt * 15_000);
+      updateHealth({ lastDailyCleanup: new Date().toISOString() });
+    } catch (error) {
+      if (isUnknownDiscordMessage(error)) {
+        await markExpiredDailyMessageCleaned(session);
+        continue;
+      }
+      console.error('Could not delete expired daily question after retries:', errorDetails(error));
+      await notifyBotInfo('daily-delete-failed', '⚠️ Expired daily question was not deleted', `The bot will try again during its next health check.\n\nError: ${String(errorDetails(error).message ?? 'Unknown error')}`);
+    }
   }
 }
 
@@ -297,8 +452,9 @@ async function resetMissedStreaks(): Promise<void> {
   const yesterday = new Date(`${today}T12:00:00Z`);
   yesterday.setUTCDate(yesterday.getUTCDate() - 1);
   const previousDate = yesterday.toISOString().slice(0, 10);
-  const { error } = await supabase.from('employee_profiles').update({ daily_streak: 0, updated_at: new Date().toISOString() }).lt('last_daily_date', previousDate).gt('daily_streak', 0);
-  if (error) throw error;
+  await retrySupabase<void>('reset missed daily streaks', () =>
+    supabase.from('employee_profiles').update({ daily_streak: 0, updated_at: new Date().toISOString() }).lt('last_daily_date', previousDate).gt('daily_streak', 0)
+  );
 }
 
 function isAdmin(interaction: ChatInputCommandInteraction): boolean {
@@ -318,11 +474,12 @@ async function correctAnswerCount(discordUserId: string): Promise<number> {
 }
 
 async function claimMilestone(discordUserId: string, kind: 'correct_answers' | 'daily_streak', milestoneValue: number): Promise<boolean> {
-  const { data, error } = await supabase
-    .from('employee_milestones')
-    .upsert({ discord_user_id: discordUserId, kind, milestone_value: milestoneValue }, { onConflict: 'discord_user_id,kind,milestone_value', ignoreDuplicates: true })
-    .select('milestone_value');
-  if (error) throw error;
+  const data = await retrySupabase<Array<{ milestone_value: number }>>('claim milestone', () =>
+    supabase
+      .from('employee_milestones')
+      .upsert({ discord_user_id: discordUserId, kind, milestone_value: milestoneValue }, { onConflict: 'discord_user_id,kind,milestone_value', ignoreDuplicates: true })
+      .select('milestone_value')
+  );
   return (data?.length ?? 0) > 0;
 }
 
@@ -339,39 +496,25 @@ async function awardAnswer(session: Session, question: Question, interaction: Bu
   if (session.kind === 'test') {
     return { correct, alreadyAnswered: false, dailyStreak: null, correctAnswerMilestone: null, streakMilestone: null };
   }
-  const pointsAwarded = correct ? (session.kind === 'daily' ? 10 : 1) : 0;
-  const { error: answerError } = await supabase.from('question_answers').insert({
-    session_id: session.id, discord_user_id: interaction.user.id, selected_option: selected,
-    is_correct: correct, points_awarded: pointsAwarded
-  });
-  if (answerError) {
-    if (answerError.code === '23505') await interaction.editReply({ content: 'You have already answered this question.' });
-    else throw answerError;
-    return { correct, alreadyAnswered: true, dailyStreak: null, correctAnswerMilestone: null, streakMilestone: null };
+  const award = await retrySupabase<{ already_answered: boolean; is_correct: boolean; daily_streak: number }[]>('record answer and update score', () =>
+    supabase.rpc('award_question_answer', {
+      p_session_id: session.id,
+      p_discord_user_id: interaction.user.id,
+      p_display_name: interaction.user.globalName ?? interaction.user.username,
+      p_selected_option: selected
+    })
+  );
+  const recorded = award[0];
+  if (!recorded) throw new Error('The answer could not be recorded.');
+  if (recorded.already_answered) {
+    await interaction.editReply({ content: 'You have already answered this question.' });
+    return { correct: recorded.is_correct, alreadyAnswered: true, dailyStreak: null, correctAnswerMilestone: null, streakMilestone: null };
   }
-
-  const { data: profile } = await supabase.from('employee_profiles').select('*').eq('discord_user_id', interaction.user.id).maybeSingle();
   const dailyDate = session.daily_date;
-  let streak = profile?.daily_streak ?? 0;
-  if (dailyDate) {
-    if (correct) {
-      const prior = new Date(`${dailyDate}T12:00:00Z`);
-      prior.setUTCDate(prior.getUTCDate() - 1);
-      streak = profile?.last_daily_date === prior.toISOString().slice(0, 10) ? streak + 1 : 1;
-    } else streak = 0;
-  }
-  const { error: profileError } = await supabase.from('employee_profiles').upsert({
-    discord_user_id: interaction.user.id,
-    display_name: interaction.user.globalName ?? interaction.user.username,
-    total_points: (profile?.total_points ?? 0) + pointsAwarded,
-    daily_streak: streak,
-    last_daily_date: dailyDate ?? profile?.last_daily_date ?? null,
-    updated_at: new Date().toISOString()
-  });
-  if (profileError) throw profileError;
+  const streak = recorded.daily_streak;
   let correctAnswerMilestone: number | null = null;
   let streakMilestone: number | null = null;
-  if (correct) {
+  if (recorded.is_correct) {
     const totalCorrect = await correctAnswerCount(interaction.user.id);
     const completedCorrectMilestone = Math.floor(totalCorrect / 25) * 25;
     if (completedCorrectMilestone > 0 && await claimMilestone(interaction.user.id, 'correct_answers', completedCorrectMilestone)) {
@@ -382,19 +525,19 @@ async function awardAnswer(session: Session, question: Question, interaction: Bu
       streakMilestone = completedStreakMilestone;
     }
   }
-  return { correct, alreadyAnswered: false, dailyStreak: dailyDate ? streak : null, correctAnswerMilestone, streakMilestone };
+  return { correct: recorded.is_correct, alreadyAnswered: false, dailyStreak: dailyDate ? streak : null, correctAnswerMilestone, streakMilestone };
 }
 
 async function answerButton(interaction: ButtonInteraction): Promise<void> {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const [, sessionId, choiceText] = interaction.customId.split(':');
   const selected = Number(choiceText);
-  const { data: sessionData, error: sessionError } = await supabase.from('question_sessions').select('*').eq('id', sessionId).single();
-  if (sessionError || !sessionData) throw new Error('Question session was not found.');
-  const session = sessionData as Session;
-  const { data: questionData, error: questionError } = await supabase.from('questions').select('*').eq('id', session.question_id).single();
-  if (questionError || !questionData) throw new Error('Question was not found.');
-  const question = questionData as Question;
+  const session = await retrySupabase<Session>('answer: question session', () =>
+    supabase.from('question_sessions').select('*').eq('id', sessionId).single()
+  );
+  const question = await retrySupabase<Question>('answer: question', () =>
+    supabase.from('questions').select('*').eq('id', session.question_id).single()
+  );
   const result = await awardAnswer(session, question, interaction, selected);
   if (result.alreadyAnswered) {
     deleteReplyAfter(interaction, SHORT_EXPIRY_MS);
@@ -534,10 +677,11 @@ async function leaderboard(interaction: PrivateInteraction): Promise<void> {
 }
 
 async function learn(interaction: PrivateInteraction, topic?: string): Promise<void> {
-  let query = supabase.from('training_cards').select('*').eq('enabled', true);
-  if (topic) query = query.ilike('topic', `%${topic}%`);
-  const { data, error } = await query;
-  if (error) throw error;
+  const data = await retrySupabase<Array<{ title: string; warning_signs: string[]; first_steps: string[]; body: string | null; sections?: Array<{ heading: string; content: string }> }>>('training cards', () => {
+    let query = supabase.from('training_cards').select('*').eq('enabled', true);
+    if (topic) query = query.ilike('topic', `%${topic}%`);
+    return query;
+  });
   if (!data?.length) return void await interaction.editReply({ content: 'No active training cards match that topic.' });
   const card = data[Math.floor(Math.random() * data.length)] as { title: string; warning_signs: string[]; first_steps: string[]; body: string | null; sections?: Array<{ heading: string; content: string }> };
   const sections = card.sections?.filter(section => section.heading && section.content) ?? [];
@@ -688,14 +832,78 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
   }
 }
 
+function dailyPostIsDue(): boolean {
+  const [minuteText, hourText] = config.cron.split(' ');
+  const now = new Intl.DateTimeFormat('en-US', { timeZone: config.timezone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date());
+  const hour = Number(now.find(part => part.type === 'hour')?.value ?? 0);
+  const minute = Number(now.find(part => part.type === 'minute')?.value ?? 0);
+  return hour * 60 + minute >= Number(hourText) * 60 + Number(minuteText);
+}
+
+let maintenanceRunning = false;
+async function runOperationalRecovery(reason: string): Promise<void> {
+  if (maintenanceRunning) return;
+  maintenanceRunning = true;
+  try {
+    await resetMissedStreaks();
+    await disableExpiredDailyQuestions();
+    await deleteExpiredDailyQuestions();
+    if (dailyPostIsDue()) await ensureDailyQuestion(reason);
+  } catch (error) {
+    console.error(`Operational recovery failed (${reason}):`, errorDetails(error));
+    await notifyBotInfo('operational-recovery-failed', '⚠️ Bot health check needs attention', `The bot could not complete its **${reason}** health check. It will try again automatically.\n\nError: ${String(errorDetails(error).message ?? 'Unknown error')}`);
+  } finally {
+    maintenanceRunning = false;
+  }
+}
+
+function registerSchedules(): void {
+  if (schedulesRegistered) return;
+  schedulesRegistered = true;
+  cron.schedule(config.cron, () => void ensureDailyQuestion('scheduled time').catch(error => console.error('Could not post daily question:', errorDetails(error))), { timezone: config.timezone });
+  cron.schedule('5,20,35,50 * * * *', () => void runOperationalRecovery('periodic catch-up'), { timezone: config.timezone });
+  cron.schedule('0 0 * * *', () => void runOperationalRecovery('midnight cleanup'), { timezone: config.timezone });
+  cron.schedule('5 0 * * *', () => void runOperationalRecovery('midnight deletion'), { timezone: config.timezone });
+  const heartbeat = setInterval(() => updateHealth({ lastHeartbeat: new Date().toISOString(), state: client.isReady() ? 'online' : 'reconnecting' }), 5 * 60 * 1000);
+  heartbeat.unref();
+}
+
 client.once(Events.ClientReady, readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}.`);
-  void resetMissedStreaks().catch(error => console.error('Could not reset missed streaks:', error));
-  cron.schedule(config.cron, () => void ensureDailyQuestion('scheduled time').catch(error => console.error('Could not post daily question:', error)), { timezone: config.timezone });
-  cron.schedule('15,30,45 6-11 * * *', () => void ensureDailyQuestion('morning catch-up').catch(error => console.error('Could not catch up daily question:', error)), { timezone: config.timezone });
-  cron.schedule('0 0 * * *', () => void resetMissedStreaks().catch(error => console.error('Could not reset missed streaks:', error)), { timezone: config.timezone });
-  cron.schedule('0 0 * * *', () => void disableExpiredDailyQuestions().catch(error => console.error('Could not disable expired daily question:', error)), { timezone: config.timezone });
-  cron.schedule('5 0 * * *', () => void deleteExpiredDailyQuestions().catch(error => console.error('Could not delete expired daily question:', error)), { timezone: config.timezone });
+  updateHealth({ state: 'online', lastHeartbeat: new Date().toISOString(), lastDiscordConnection: new Date().toISOString() });
+  registerSchedules();
+  void notifyBotInfo('bot-online', wasUnhealthyAtStartup ? '⚠️ Bot reconnected after an interruption' : '✅ Pet First Aid Bot is online', wasUnhealthyAtStartup ? 'The health record indicates that the bot may have been offline or unreachable for more than 10 minutes. It is online now and is checking for missed work.' : 'The bot is connected and completing its startup health check.', wasUnhealthyAtStartup ? 0xd69e2e : 0x237804);
+  void runOperationalRecovery('startup catch-up');
+});
+
+client.on(Events.ShardDisconnect, () => {
+  updateHealth({ state: 'reconnecting', lastHeartbeat: new Date().toISOString(), lastError: 'Discord gateway disconnected; Discord.js is reconnecting.' });
+  void notifyBotInfo('discord-disconnected', '⚠️ Bot temporarily disconnected from Discord', 'Discord.js is attempting to reconnect automatically.');
+});
+client.on(Events.ShardResume, () => {
+  updateHealth({ state: 'online', lastHeartbeat: new Date().toISOString(), lastDiscordConnection: new Date().toISOString() });
+  console.log('Bot reconnected to Discord.');
+});
+client.on(Events.Error, error => {
+  console.error('Discord client error:', errorDetails(error));
+  updateHealth({ state: 'reconnecting', lastError: String(errorDetails(error).message ?? 'Discord client error') });
 });
 client.on('interactionCreate', interaction => void handleInteraction(interaction));
-client.login(config.discordToken);
+
+async function startBot(): Promise<void> {
+  let delay = 15_000;
+  while (!client.isReady()) {
+    try {
+      await client.login(config.discordToken);
+      return;
+    } catch (error) {
+      console.error('Could not connect to Discord at startup:', errorDetails(error));
+      updateHealth({ state: 'reconnecting', lastHeartbeat: new Date().toISOString(), lastError: String(errorDetails(error).message ?? 'Discord connection failed') });
+      console.warn(`Startup connection will retry in ${Math.ceil(delay / 1_000)} seconds.`);
+      await wait(delay);
+      delay = Math.min(delay * 2, 5 * 60 * 1000);
+    }
+  }
+}
+
+void startBot();
